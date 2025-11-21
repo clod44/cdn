@@ -8,7 +8,15 @@ usage() {
     echo "Targeting Safety: Active Session is $CURRENT_TTY"
     echo ""
     echo "Available Targets:"
-    who | awk '{print "  " $2 " (" $1 ")"}'
+    # This awk command formats columns: TTY ($2), User ($1), and IP ($5)
+    who | awk '{
+        # Remove parentheses from the IP address (Column 5)
+        gsub(/[()]/, "", $5);
+        # If IP is empty (local session), label it LOCAL
+        if ($5 == "") $5 = "LOCAL";
+        # Print in a neat table format
+        printf "  %-10s | User: %-10s | Source: %s\n", $2, $1, $5
+    }'
     echo ""
     echo "Modes:"
     echo "  -r   Random Flood (default)"
