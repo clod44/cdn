@@ -1,0 +1,157 @@
+#!/bin/bash
+
+# This script generates a continuously animating sine wave of 'I' characters,
+# filling the gaps between points to draw a connected line.
+# It automatically adjusts to terminal width and allows for frequency control.
+
+# --- Global Configuration ---
+FILL_CHAR="#"
+ANIMATION_DELAY=0.03 # Delay between lines (in seconds). Smaller values make it faster.
+
+# --- Functions ---
+
+# Function to get terminal width
+# Returns the actual number of available columns (e.g., if tput cols is 147, returns 147)
+get_terminal_width() {
+    local width=$(tput cols 2>/dev/null)
+    if [ -z "$width" ] || [ "$width" -le 1 ]; then
+        echo 80 # Fallback width
+    else
+        echo "$width" - 1 # Return the actual detected width
+    fi
+}
+
+# Function to validate and get points per cycle
+get_points_per_cycle() {
+    local default_points_per_cycle=40
+    local input_points_per_cycle="${1:-$default_points_per_cycle}"
+
+    if ! [[ "$input_points_per_cycle" =~ ^[0-9]+$ ]]; then
+        echo "Error: POINTS_PER_CYCLE must be a positive integer." >&2
+        echo "Usage: $0 [POINTS_PER_CYCLE]" >&2
+        exit 1
+    fi
+
+    if (( input_points_per_cycle <= 0 )); then
+        echo "Error: POINTS_PER_CYCLE must be positive." >&2
+        echo "Usage: $0 [POINTS_PER_CYCLE]" >&2
+        exit 1
+    fi
+
+    echo "$input_points_per_cycle"
+}
+
+# Function to calculate PI
+get_pi() {
+    echo "scale=20; 4*a(1)" | bc -l
+}
+
+# Function to pre-calculate one full sine wave period's horizontal positions
+# Args: $1 = points_per_cycle, $2 = actual_terminal_width
+precalculate_wave_indentations() {
+    local points_per_cycle=$1
+    local actual_terminal_width=$2 # This is the full terminal width (e.g., 147)
+    local max_column_index=$((actual_terminal_width - 1)) # Max 0-indexed column (e.g., 146)
+
+    local pi=$(get_pi)
+    local two_pi=$(echo "scale=20; 2 * $pi" | bc -l)
+    local angle_increment=$(echo "scale=20; $two_pi / $points_per_cycle" | bc -l)
+
+    local -a indentations_array
+    for (( i=0; i<points_per_cycle; i++ )); do
+        local current_angle=$(echo "scale=20; $i * $angle_increment" | bc -l)
+        local sine_value=$(echo "scale=20; s($current_angle)" | bc -l)
+
+        # Scale sine_value from [-1, 1] to [0, max_column_index]
+        # (sine_value + 1) / 2 converts [-1, 1] to [0, 1]
+        # Then multiply by max_column_index to map to the 0-indexed column range
+        local indentation=$(echo "scale=20; ((($sine_value + 1) / 2) * $max_column_index) + 0.5" | bc -l | cut -d'.' -f1)
+        indentation=$((indentation < 0 ? 0 : indentation)) # Ensure non-negative
+
+        indentations_array[$i]=$indentation
+    done
+    echo "${indentations_array[@]}" # Return array as space-separated string
+}
+
+# Function to set up terminal and signal traps
+setup_terminal_and_traps() {
+    tput civis # Make cursor invisible
+    trap "cleanup_terminal" INT TERM # Trap Ctrl+C and termination signals
+}
+
+# Function to clean up terminal on exit
+cleanup_terminal() {
+    tput cnorm # Make cursor normal
+    echo -e '\n--- Exiting ---\n'
+    exit 0
+}
+
+# Function to draw a single line segment
+# Args: $1 = fill_start (0-indexed), $2 = fill_end (0-indexed), $3 = fill_char
+draw_line_segment() {
+    local fill_start=$1
+    local fill_end=$2
+    local fill_char=$3
+
+    # Ensure fill_start is the smaller value
+    if (( fill_start > fill_end )); then
+        local temp=$fill_start
+        fill_start=$fill_end
+        fill_end=$temp
+    fi
+
+    local num_chars=$((fill_end - fill_start + 1))
+    if (( num_chars < 1 )); then # Should not happen if fill_start <= fill_end and positive
+        num_chars=1
+    fi
+
+    # Clear the current line and move cursor
+    printf "\r\033[K"
+    
+    # tput hpa is 1-indexed, so add 1 to our 0-indexed column position
+    tput hpa "$((fill_start + 1))" 
+
+    # Print the line segment
+    printf "%s" "$(printf "$fill_char%.0s" $(seq 1 "$num_chars"))"
+    
+    # Move to the next line
+    printf "\n"
+}
+
+# --- Main Logic ---
+main() {
+    local points_per_cycle=$(get_points_per_cycle "$1")
+    local actual_terminal_width=$(get_terminal_width) # Get the full width
+
+    # Read the space-separated string back into an array
+    local -a WAVE_INDENTATIONS=($(precalculate_wave_indentations "$points_per_cycle" "$actual_terminal_width"))
+
+    echo "Generating connected sine wave pattern (Auto-Width: $actual_terminal_width, Points per Cycle: $points_per_cycle):"
+    echo "---"
+
+    setup_terminal_and_traps
+
+    # Initialize PREVIOUS_INDENTATION with the first point from the pre-calculated wave
+    local PREVIOUS_INDENTATION="${WAVE_INDENTATIONS[0]}"
+
+    local ANIMATION_OFFSET=0
+
+    while true; do
+        local PREVIOUS_INDENT_INDEX=$(( (ANIMATION_OFFSET - 1 + points_per_cycle) % points_per_cycle ))
+        local CURRENT_INDENT_INDEX=$(( ANIMATION_OFFSET % points_per_cycle ))
+
+        local PREVIOUS_INDENTATION_VAL=${WAVE_INDENTATIONS[$PREVIOUS_INDENT_INDEX]}
+        local CURRENT_INDENTATION_VAL=${WAVE_INDENTATIONS[$CURRENT_INDENT_INDEX]}
+
+        # Pass 0-indexed values to draw_line_segment
+        draw_line_segment "$PREVIOUS_INDENTATION_VAL" "$CURRENT_INDENTATION_VAL" "$FILL_CHAR"
+
+        # Advance the animation offset
+        ANIMATION_OFFSET=$(( (ANIMATION_OFFSET + 1) % points_per_cycle ))
+
+        sleep "$ANIMATION_DELAY"
+    done
+}
+
+# Call the main function with all script arguments
+main "$@"

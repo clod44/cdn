@@ -1,0 +1,91 @@
+#!/bin/bash
+
+# A simple and lightweight script to manage active SSH connections.
+# It displays a list of connected users, their login time, and PIDs.
+
+while true; do
+  clear
+  echo "Active SSH Connections:"
+  echo "----------------------"
+
+  # Get the current shell's terminal device (TTY)
+  CURRENT_TTY=$(tty | sed 's/\/dev\///')
+
+  # Use a counter to number the sessions
+  COUNTER=1
+
+  # Use 'who' to list users and their sessions. The output is more consistent than 'w'
+  who | while read -r USER TTY LOGIN_DATE LOGIN_TIME; do
+    # Check if the current session's TTY matches the user's TTY
+    if [ "$TTY" == "$CURRENT_TTY" ]; then
+      IS_CURRENT="(current shell)"
+    else
+      IS_CURRENT=""
+    fi
+    
+    # Get the PID and command of the shell running on this TTY.
+    # We use 'ps -t' for a reliable lookup by TTY.
+    # The 'head -n 1' ensures we get the first process (the shell) for the TTY.
+    # 'tail -n +2' is used to remove the header.
+    PID_INFO=$(ps -t "$TTY" -o pid= | head -n 1 | tr -d '[:space:]')
+    
+    # Print the formatted output with all the details
+    printf "%2d. %-10s %-8s %-15s PID: %-8s %s\n" "$COUNTER" "$USER" "$TTY" "$LOGIN_DATE $LOGIN_TIME" "$PID_INFO" "$IS_CURRENT"
+    
+    # Increment the counter for the next line
+    ((COUNTER++))
+  done
+
+  echo "----------------------"
+  echo "Type the number of the session to terminate or press Enter to refresh."
+  echo "Press Ctrl+C to exit."
+
+  # Prompt the user for a choice.
+  read -p "Your choice: " CHOICE
+
+  # Check if the user wants to refresh the list or provided no input.
+  if [ -z "$CHOICE" ]; then
+    continue
+  fi
+
+  # Validate the input to ensure it's a number.
+  if ! [[ "$CHOICE" =~ ^[0-9]+$ ]]; then
+    echo "Invalid input. Please enter a number."
+    sleep 2
+    continue
+  fi
+
+  # Find the TTY of the chosen session by re-running the 'who' command and selecting the correct line
+  TARGET_TTY=$(who | sed -n "${CHOICE}p" | awk '{print $2}')
+  if [ -z "$TARGET_TTY" ]; then
+    echo "Invalid choice. Please enter a valid number."
+    sleep 2
+    continue
+  fi
+
+  # Get the PID of the target TTY.
+  PID_TO_KILL=$(ps -t "$TARGET_TTY" -o pid= | head -n 1 | tr -d '[:space:]')
+
+  # Check if the PID was found.
+  if [ -z "$PID_TO_KILL" ]; then
+    echo "Invalid choice or session has already ended."
+    sleep 2
+    continue
+  fi
+
+  # Check if the user is trying to kill their own session
+  if [ "$TARGET_TTY" == "$CURRENT_TTY" ]; then
+    echo "You cannot terminate your own shell from this script."
+    sleep 3
+    continue
+  fi
+
+  # Confirm the termination with the user.
+  echo "Terminating session on $TARGET_TTY (PID: $PID_TO_KILL)..."
+  
+  # Terminate the process using the 'kill -9' command.
+  sudo kill -9 "$PID_TO_KILL"
+
+  echo "Session terminated. Press Enter to continue."
+  read
+done

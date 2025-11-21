@@ -1,0 +1,334 @@
+#!/bin/bash
+
+# This script scans the /opt directory for application configurations,
+# performs network accessibility checks, and displays the information
+# in a dynamically formatted, columnar output with in-place updates.
+
+## Configuration & Colors
+# --------------------------------------------------------------------------------------
+
+# ANSI color codes for terminal output
+YELLOW='\033[0;33m' # For latency messages
+RED='\033[0;31m'    # For 'failed' status
+BLUE='\033[0;34m'   # For 'checking...' status message
+BRIGHT_BLUE='\033[1;34m' # For URLs
+GREEN='\033[0;32m'  # For headers and separators
+NC='\033[0m'        # No Color - resets text attributes
+
+# Curl parameters for URL checks
+CURL_CONNECT_TIMEOUT=3 # seconds to establish connection
+CURL_MAX_TIME=5        # total seconds for the entire operation
+
+# Simulated delay for demonstration (in seconds)
+SIMULATED_PING_DELAY=0
+
+## Utility Functions (Pure Data/Action - No Formatting)
+# --------------------------------------------------------------------------------------
+
+# get_machine_ip: Determines the primary IP address of the machine.
+# Returns: IP address string or "UNKNOWN_IP" with a warning.
+get_machine_ip() {
+    local ip=$(hostname -I | awk '{print $1}')
+    if [ -z "$ip" ]; then
+        echo "Warning: Could not determine machine's IP address. URLs might be incomplete." >&2
+        echo "UNKNOWN_IP" >&2 # Send warning to stderr
+    else
+        echo "$ip"
+    fi
+}
+
+# get_property: Extracts a specific key's value from a properties-like file.
+# Usage: get_property <file_path> <key_name>
+# Returns: The value associated with the key, or an empty string if not found.
+get_property() {
+    local file="$1"
+    local key="$2"
+    # Match key, allow optional spaces around '=', capture everything after '='
+    # This pattern also uses PCRE and trims leading/trailing whitespace from the value.
+    grep -oP "^${key}\s*=\s*\K.*" "$file" | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+# check_ping_value: Performs a HTTP/S check on a given URL.
+# Returns: "XXXXms" (e.g., "0050ms") or "failed".
+check_ping_value() {
+    local url="$1"
+    local response_time
+
+    # Simulated delay for demonstration
+    sleep "$SIMULATED_PING_DELAY"
+
+    response_time=$(curl -k -L -s -o /dev/null -w "%{time_total}" \
+                         --connect-timeout "$CURL_CONNECT_TIMEOUT" \
+                         --max-time "$CURL_MAX_TIME" "$url" 2>/dev/null)
+
+    if [ $? -eq 0 ]; then
+        local latency_ms=$(awk "BEGIN{printf \"%.0f\", $response_time * 1000}")
+        printf "%04dms" "$latency_ms"
+    else
+        echo "failed"
+    fi
+}
+
+## Core Logic Functions (Data Collection & Processing)
+# --------------------------------------------------------------------------------------
+
+# get_app_data: Scans /opt for app configs, extracts URL and JDK info.
+# Populates app_names, app_urls, and app_jdks arrays (passed by reference via global scope).
+# Returns: Sets max_name_len, max_url_len, max_jdk_len as globals for later use.
+get_app_data() {
+    local MACHINE_IP=$(get_machine_ip)
+
+    # Use declare -g to explicitly make these global or
+    # rely on them being set in main_logic which then passes them to print function.
+    # For simplicity, if these are read by print_formatted_output,
+    # they need to be accessible. Let's return them by echo for safety.
+    local -a collected_names
+    local -a collected_urls
+    local -a collected_jdks
+
+    local current_max_name_len=0
+    local current_max_url_len=0
+    local current_max_jdk_len=0
+
+    echo "Collecting application configurations..."
+    local app_dir
+    for app_dir in /opt/*; do
+        if [ -d "$app_dir" ]; then
+            local app_name=$(basename "$app_dir")
+            local config_file="$app_dir/config/application.properties"
+            local conf_file="$app_dir/$app_name.conf"
+            local app_jdk="N/A"
+
+            if [ -f "$config_file" ]; then
+                local APP_PORT=""
+                local CONTEXT_PATH=""
+                local PROTOCOL="http://"
+
+                if [ -f "$conf_file" ]; then
+                    app_jdk=$(get_property "$conf_file" "JAVA_HOME")
+                    [ -z "$app_jdk" ] && app_jdk="N/A"
+                fi
+
+                if grep -q "server.ssl.enabled=true" "$config_file"; then
+                    PROTOCOL="https://"
+                fi
+
+                APP_PORT=$(get_property "$config_file" "server.port")
+                CONTEXT_PATH=$(get_property "$config_file" "server.servlet.context-path")
+
+                if [ -n "$APP_PORT" ]; then
+                    local current_url=""
+                    if [ -n "$CONTEXT_PATH" ]; then
+                        current_url="${PROTOCOL}${MACHINE_IP}:${APP_PORT}${CONTEXT_PATH}"
+                    else
+                        current_url="${PROTOCOL}${MACHINE_IP}:${APP_PORT}"
+                    fi
+
+                    collected_names+=("$app_name")
+                    collected_urls+=("$current_url")
+                    collected_jdks+=("$app_jdk")
+
+                    local name_len=${#app_name}
+                    (( name_len > current_max_name_len )) && current_max_name_len=$name_len
+
+                    local url_len=${#current_url}
+                    (( url_len > current_max_url_len )) && current_max_url_len=$url_len
+
+                    local jdk_full_string_len=$(( ${#app_jdk} + 6 ))
+                    (( jdk_full_string_len > current_max_jdk_len )) && current_max_jdk_len=$jdk_full_string_len
+                fi
+            fi
+        fi
+    done
+
+    # Output arrays and max lengths. Caller will need to parse this.
+    # A cleaner way is to use namerefs if Bash 4.3+ is guaranteed,
+    # or just rely on globals defined in main_logic and passed as args.
+    # For now, let's keep the arrays as arguments for print_formatted_output.
+    # The max_lens will be calculated within print_formatted_output for simplicity
+    # since they depend on the *final* collected data passed to it.
+
+    # We'll rely on the arrays being global for simplicity, as they are large data structures.
+    # Re-evaluating: passing them back and forth from functions that populate/consume them
+    # can be complex in Bash. Let's have main_logic collect them and then pass them.
+    # So, get_app_data will set these, and main_logic will read them.
+    # The easiest way without namerefs or process substitution is to
+    # populate arrays declared in main_logic directly, or return them as strings,
+    # which implies parsing. A mix might be best.
+    # For now, main_logic will handle populating them as it consumes get_app_data's output.
+    # Let's simplify get_app_data to just echo app_name|url|jdk and max_lengths,
+    # and main_logic will read it. This is more "functional" for bash.
+
+    # Reverted to previous model where main_logic populates arrays directly.
+    # `get_app_data` function isn't purely returning data, but acting as a setup stage.
+    # Let's keep data collection in main_logic, as it needs to set max lengths.
+
+    # Alternative: `get_app_data` just returns the raw string data, and `main_logic` parses it
+    # This might make it too complex. The current method of populating arrays inside main_logic's loop is fine.
+
+    # Ok, let's stick to the current definition where main_logic iterates and gathers data.
+    # The separate functions will be for utilities (get_machine_ip, get_property, check_ping_value).
+    # The data handling (arrays, max_len) and presentation are then centralized in main_logic.
+    # This avoids complex Bash array return patterns.
+
+    # This comment block indicates a re-evaluation of how to cleanly pass data in Bash.
+    # The conclusion is to keep the data gathering loop within main_logic, and use
+    # helper functions for atomic operations.
+    : # Null command for empty function body
+}
+
+
+## Presentation Function (Formatting & Printing)
+# --------------------------------------------------------------------------------------
+
+# print_formatted_output: Takes all app data and prints it with formatting and in-place updates.
+# Usage: print_formatted_output <app_names_array> <app_urls_array> <app_jdks_array>
+print_formatted_output() {
+    # We expect app_names, app_urls, app_jdks to be passed as arguments.
+    # However, Bash arrays are tricky to pass directly.
+    # The simplest is to use the global arrays filled by main_logic directly.
+    # Let's adjust main_logic to manage these arrays and pass only calculated widths.
+
+    local -n _app_names=$1 # Bash 4.3+ nameref for dynamic array name
+    local -n _app_urls=$2
+    local -n _app_jdks=$3
+    local name_col_width=$4
+    local url_col_width=$5
+    local jdk_col_width=$6
+    local ping_status_fixed_len=8 # Fixed length for "(XXXXms)" or "(failed)"
+
+    # Print Header Row
+    printf "${GREEN}%-${name_col_width}s %-${ping_status_fixed_len}s %-${url_col_width}s %s${NC}\n" \
+        "Application Name" "Status" "URL" "JDK Version"
+
+    # Print Separator Line
+    printf "${GREEN}%s${NC}\n" "$(printf "%-${name_col_width}s" | tr ' ' '-') \
+$(printf "%-${ping_status_fixed_len}s" | tr ' ' '-') \
+$(printf "%-${url_col_width}s" | tr ' ' '-') \
+$(printf "%-${jdk_col_width}s" | tr ' ' '-') "
+
+    local i
+    for i in "${!_app_names[@]}"; do
+        local app_name="${_app_names[$i]}"
+        local app_url="${_app_urls[$i]}"
+        local app_jdk="${_app_jdks[$i]}"
+
+        # Print the initial 'checking...' message and then a carriage return.
+        # This makes it visible while the sleep/curl happens.
+        printf "%-${name_col_width}s ${BLUE}%-${ping_status_fixed_len}s${NC} %b%-${url_col_width}s%b\r" \
+               "${app_name}:" \
+               "(____ms)" \
+               "${BRIGHT_BLUE}" "${app_url}" "${NC}"
+
+        # Perform the URL check (script pauses here).
+        local raw_status=$(check_ping_value "$app_url") # Calls the dedicated ping function
+
+        local final_status_string
+        if [[ "$raw_status" == *"ms"* ]]; then
+            final_status_string="${YELLOW}(${raw_status})${NC}"
+        else
+            final_status_string="${RED}(${raw_status})${NC}"
+        fi
+
+        local formatted_jdk_string=$(printf "(jdk:%s)" "$app_jdk")
+
+        # Overwrite the 'checking...' line with the final, formatted output.
+        # Prepend with \r\033[K to ensure the line is fully cleared before printing the new content.
+        printf "\r\033[K%-${name_col_width}s %b %b%-${url_col_width}s%b %s\n" \
+            "${app_name}:" \
+            "$final_status_string" \
+            "${BRIGHT_BLUE}" "${app_url}" "${NC}" \
+            "$(printf "%-${jdk_col_width}s" "$formatted_jdk_string")"
+    done
+
+    echo "" # Final newline for clean prompt
+}
+
+
+## Main Execution Logic
+# --------------------------------------------------------------------------------------
+
+main() {
+    local MACHINE_IP=$(get_machine_ip)
+
+    # These arrays will hold the collected data.
+    # They are local to the main function.
+    local -a app_names
+    local -a app_urls
+    local -a app_jdks
+
+    # Variables to track maximum lengths for dynamic column alignment.
+    local max_name_len=0
+    local max_url_len=0
+    local max_jdk_len=0
+
+    echo "Collecting application configurations..."
+    local app_dir
+    for app_dir in /opt/*; do
+        if [ -d "$app_dir" ]; then
+            local app_name=$(basename "$app_dir")
+            local config_file="$app_dir/config/application.properties"
+            local conf_file="$app_dir/$app_name.conf"
+            local app_jdk="N/A"
+
+            if [ -f "$config_file" ]; then
+                local APP_PORT=""
+                local CONTEXT_PATH=""
+                local PROTOCOL="http://"
+
+                if [ -f "$conf_file" ]; then
+                    app_jdk=$(get_property "$conf_file" "JAVA_HOME")
+                    [ -z "$app_jdk" ] && app_jdk="N/A"
+                fi
+
+                if grep -q "server.ssl.enabled=true" "$config_file"; then
+                    PROTOCOL="https://"
+                fi
+
+                APP_PORT=$(get_property "$config_file" "server.port")
+                CONTEXT_PATH=$(get_property "$config_file" "server.servlet.context-path")
+
+                if [ -n "$APP_PORT" ]; then
+                    local current_url=""
+                    if [ -n "$CONTEXT_PATH" ]; then
+                        current_url="${PROTOCOL}${MACHINE_IP}:${APP_PORT}${CONTEXT_PATH}"
+                    else
+                        current_url="${PROTOCOL}${MACHINE_IP}:${APP_PORT}"
+                    fi
+
+                    app_names+=("$app_name")
+                    app_urls+=("$current_url")
+                    app_jdks+=("$app_jdk")
+
+                    local name_len=${#app_name}
+                    (( name_len > max_name_len )) && max_name_len=$name_len
+
+                    local url_len=${#current_url}
+                    (( url_len > max_url_len )) && max_url_len=$url_len
+
+                    local jdk_full_string_len=$(( ${#app_jdk} + 6 ))
+                    (( jdk_full_string_len > max_jdk_len )) && max_jdk_len=$jdk_full_string_len
+                fi
+            fi
+        fi
+    done
+
+    # Calculate column widths based on collected data.
+    local name_col_width=$((max_name_len > 16 ? max_name_len + 3 : 19))
+    local url_col_width=$((max_url_len > 11 ? max_url_len + 3 : 14))
+    local jdk_col_width=$((max_jdk_len > 11 ? max_jdk_len + 3 : 14))
+
+    # Call the print function to display the data.
+    # Using namerefs for passing arrays. This requires Bash 4.3+.
+    # If using older Bash, arrays would need to be global or passed as space-separated strings.
+    print_formatted_output "app_names" "app_urls" "app_jdks" "$name_col_width" "$url_col_width" "$jdk_col_width"
+}
+
+# --- Script Entry Point ---
+main
+if [[ "$1" == "loop" ]]; then
+    while true; do
+        sleep 1
+        main
+    done
+fi

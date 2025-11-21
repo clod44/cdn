@@ -1,0 +1,186 @@
+#!/bin/bash
+
+MAX_FILE_SIZE_MB=50
+MIN_FILE_SIZE_MB=1
+FILE_PREFIX="dummy_file_"
+TARGET_MAX_PERCENT=90
+DELAY_SECONDS=3
+
+CURRENT_DIRECTION=1
+
+show_help() {
+    SCRIPT_NAME=$(basename "$0")
+    echo "Usage: $SCRIPT_NAME [OPTIONS] <MOUNT_POINT>"
+    echo "Example: sudo $SCRIPT_NAME -t 1 /media/Dicom2"
+    echo ""
+    echo "Options:"
+    echo "  -t <SECONDS>  Set delay between actions (default: 3)"
+    echo "  -mb <SIZE>    Set max file size in MB (default: 50)"
+    echo "  -h, --help    Show this help message"
+    echo ""
+    echo "Description:"
+    echo "  Creates a 'dummy_files' directory in the target path."
+    echo "  Fills it with random files until 90% disk usage, then deletes them."
+    echo "  Cleans up the directory automatically upon exit (Ctrl+C)."
+    exit 1
+}
+
+# --- Argument Parsing ---
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help)
+            show_help
+            ;;
+        -t)
+            if [[ "$2" =~ ^[0-9]+$ ]]; then
+                DELAY_SECONDS="$2"
+                shift # past argument
+                shift # past value
+            else
+                echo "[ERROR] -t requires an integer value (e.g. -t 1)."
+                exit 1
+            fi
+            ;;
+        -mb)
+            if [[ "$2" =~ ^[0-9]+$ ]]; then
+                MAX_FILE_SIZE_MB="$2"
+                shift # past argument
+                shift # past value
+            else
+                echo "[ERROR] -mb requires an integer value (e.g. -mb 100)."
+                exit 1
+            fi
+            ;;
+        *)
+            BASE_DIR="$1"
+            shift # past argument
+            ;;
+    esac
+done
+
+# Validate Mount Point
+if [ -z "$BASE_DIR" ]; then
+    echo "[ERROR] Missing mount point argument."
+    show_help
+fi
+
+if [ "$EUID" -ne 0 ]; then
+    echo "[WARNING] This script works best with 'sudo'."
+    echo "   Without it, you might encounter permission errors on mounted drives."
+    echo "   Starting in 3 seconds..."
+    sleep 3
+fi
+
+BASE_DIR="${BASE_DIR%/}"
+DUMMY_DIR="${BASE_DIR}/dummy_files"
+
+cleanup() {
+    echo ""
+    echo "[STOP] Stopping script..."
+    if [ -d "$DUMMY_DIR" ]; then
+        echo "[CLEANUP] Removing $DUMMY_DIR..."
+        rm -rf "$DUMMY_DIR"
+        echo "[OK] Cleanup complete."
+    fi
+    exit 0
+}
+
+trap cleanup EXIT SIGINT SIGTERM
+
+echo "[INIT] Setting up directory: $DUMMY_DIR"
+if ! mkdir -p "$DUMMY_DIR"; then
+    echo "[ERROR] Could not create directory. Check permissions."
+    exit 1
+fi
+
+get_disk_info() {
+    DF_INFO=$(df -k "$BASE_DIR" | tail -n 1)
+    
+    if [ -z "$DF_INFO" ]; then
+        echo "[ERROR] Cannot read disk stats for $BASE_DIR"
+        exit 1
+    fi
+
+    TOTAL_SPACE_MB=$(echo "$DF_INFO" | awk '{print int($2 / 1024)}')
+    CURRENT_PERCENT=$(echo "$DF_INFO" | awk '{print $5}' | sed 's/%//')
+}
+
+calculate_display_limits() {
+    get_disk_info
+    MAX_MB=$(($TOTAL_SPACE_MB * $TARGET_MAX_PERCENT / 100))
+}
+
+echo "[START] Starting simulation on $BASE_DIR..."
+echo "   Target Max: $TARGET_MAX_PERCENT% | File Sizes: ${MIN_FILE_SIZE_MB}-${MAX_FILE_SIZE_MB}MB"
+
+while true; do
+    
+    calculate_display_limits
+    
+    CURRENT_FILES=$(find "$DUMMY_DIR" -maxdepth 1 -type f -name "${FILE_PREFIX}*" | wc -l)
+
+    CURRENT_DUMMY_MB=$(du -scBM "$DUMMY_DIR" 2>/dev/null | tail -n 1 | awk '{print int($1)}' | sed 's/[^0-9]*//g')
+    [ -z "$CURRENT_DUMMY_MB" ] && CURRENT_DUMMY_MB=0
+    
+    DIR_ICON="[UP]"
+    if [ "$CURRENT_DIRECTION" -eq 0 ]; then DIR_ICON="[DOWN]"; fi
+    
+    echo "----------------------------------------------------------------"
+    echo "$(date +'%H:%M:%S') | Disk: $CURRENT_PERCENT% (Target Max: $TARGET_MAX_PERCENT%)"
+    echo "Status: $DIR_ICON | Files: $CURRENT_FILES | Size: ${CURRENT_DUMMY_MB}MB"
+
+    if [ "$CURRENT_PERCENT" -ge "$TARGET_MAX_PERCENT" ]; then
+        if [ "$CURRENT_DIRECTION" -eq 1 ]; then
+            CURRENT_DIRECTION=0
+            echo "[!] CEILING HIT ($CURRENT_PERCENT%). Switching to DELETE mode."
+        fi
+    fi
+    
+    if [ "$CURRENT_FILES" -eq 0 ]; then
+        if [ "$CURRENT_DIRECTION" -eq 0 ]; then
+            CURRENT_DIRECTION=1
+            echo "[!] FLOOR HIT (0 files). Switching to CREATE mode."
+        fi
+    fi
+    
+    if [ "$CURRENT_DIRECTION" -eq 1 ]; then
+        
+        if [ "$CURRENT_PERCENT" -lt "$TARGET_MAX_PERCENT" ]; then
+            RANDOM_SIZE_MB=$(( $MIN_FILE_SIZE_MB + $RANDOM % ($MAX_FILE_SIZE_MB - $MIN_FILE_SIZE_MB + 1) ))
+            NEW_FILENAME="${FILE_PREFIX}$(date +%s%N)"
+            
+            if dd if=/dev/zero of="${DUMMY_DIR}/${NEW_FILENAME}" bs=1M count="$RANDOM_SIZE_MB" status=none; then
+                 echo "   [+] Created $RANDOM_SIZE_MB MB file."
+            else
+                 echo "   [!] Creation failed (Disk full?). Forcing DOWN."
+                 CURRENT_DIRECTION=0
+            fi
+        else
+             echo "   [!] Safety Guard: Over limit. Waiting for flip."
+             CURRENT_DIRECTION=0
+        fi
+        
+    else
+        
+        if [ "$CURRENT_FILES" -gt 0 ]; then
+            ALL_FILES=("$DUMMY_DIR"/${FILE_PREFIX}*)
+            NUM_FILES=${#ALL_FILES[@]}
+            
+            if [ "$NUM_FILES" -gt 0 ]; then
+                RANDOM_INDEX=$(( $RANDOM % $NUM_FILES ))
+                FILE_TO_DELETE="${ALL_FILES[$RANDOM_INDEX]}"
+                
+                if [ -f "$FILE_TO_DELETE" ]; then
+                    SIZE=$(du -h "$FILE_TO_DELETE" | awk '{print $1}')
+                    rm -f "$FILE_TO_DELETE"
+                    echo "   [-] Deleted random file ($SIZE)."
+                fi
+            fi
+        else
+            echo "   [!] Floor Guard: No files. Waiting for flip."
+            CURRENT_DIRECTION=1
+        fi
+    fi
+    
+    sleep "$DELAY_SECONDS"
+done

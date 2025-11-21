@@ -1,0 +1,240 @@
+#!/bin/bash
+
+# ANSI Color Codes
+# Using `tput` for terminal compatibility
+GREEN=$(tput setaf 2)
+YELLOW=$(tput setaf 3)
+CYAN=$(tput setaf 6)
+BOLD=$(tput bold)
+RESET=$(tput sgr0)
+
+# Configuration
+HOST="127.0.0.1"
+START_PORT=1
+END_PORT=65600
+
+# Function to display the help page and exit
+function show_help() {
+    echo "${BOLD}Usage:${RESET} $0 [options]"
+    echo ""
+    echo "This script scans for open ports on the local machine (localhost)."
+    echo ""
+    echo "${BOLD}Options:${RESET}"
+    echo "  ${BOLD}-h${RESET}              Show this help page and exit."
+    echo "  ${BOLD}-min <port>${RESET}     Start scanning from this port. (e.g., -min 1024)"
+    echo "  ${BOLD}-max <port>${RESET}     Scan up to this port. (e.g., -max 5000)"
+    echo "  ${BOLD}<port>${RESET}          A single positional argument to set the maximum port."
+    echo ""
+    echo "${BOLD}Examples:${RESET}"
+    echo "  $0"
+    echo "  $0 -max 1024"
+    echo "  $0 -min 1000 -max 2000"
+    echo "  $0 1024"
+    exit 0
+}
+
+# Parse command-line options using a while loop for robust handling
+while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            show_help
+            ;;
+        -min|--min)
+            # Check if a value is provided and it's a valid integer
+            if [[ -n "$2" ]] && [[ "$2" =~ ^[0-9]+$ ]]; then
+                START_PORT=$2
+                shift 2 # Shift past both the flag and its value
+            else
+                echo "${YELLOW}⚠️ Invalid or missing value for -min. Please provide a positive integer.${RESET}"
+                show_help
+            fi
+            ;;
+        -max|--max)
+            # Check if a value is provided and it's a valid integer
+            if [[ -n "$2" ]] && [[ "$2" =~ ^[0-9]+$ ]]; then
+                END_PORT=$2
+                shift 2 # Shift past both the flag and its value
+            else
+                echo "${YELLOW}⚠️ Invalid or missing value for -max. Please provide a positive integer.${RESET}"
+                show_help
+            fi
+            ;;
+        *)
+            # Handle the single positional argument for backward compatibility
+            if [[ "$1" =~ ^[0-9]+$ ]]; then
+                END_PORT="$1"
+                shift 1 # Shift past the positional argument
+            else
+                echo "${YELLOW}⚠️ Invalid argument. Please provide a valid port number (e.g., scan_my_ports 1024).${RESET}"
+                show_help
+            fi
+            ;;
+    esac
+done
+
+# Validate that the start port is not greater than the end port
+if [ "$START_PORT" -gt "$END_PORT" ]; then
+    echo "${YELLOW}⚠️ The start port (-min) cannot be greater than the end port (-max).${RESET}"
+    exit 1
+fi
+
+# Sudo warning for best results
+if [ "$EUID" -ne 0 ]; then
+    echo "${YELLOW}⚠️"
+    echo "Warning: This script requires sudo privileges for best results."
+    echo "⚠️${RESET}"
+fi
+
+# Create a timestamped log file in the script's directory
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+LOG_FILE="$SCRIPT_DIR/scan_my_ports_$(date +%Y-%m-%d_%H-%M-%S).log"
+
+# Calculate the total number of ports to scan based on the final END_PORT value
+TOTAL_PORTS=$((END_PORT - START_PORT + 1))
+PORTS_CHECKED=0
+
+# Function to find the local IP address of the primary network interface
+# This is used to construct URLs for services open to the local network.
+function get_local_ip() {
+    # This command gets the primary IPv4 address, excluding the loopback address.
+    ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1' | head -n 1
+}
+
+# Function to find the process name and path for a given port using the /proc filesystem.
+# This is a reliable method that does not require sudo.
+function find_proc_info() {
+    local port=$1
+    local hex_port=$(printf "%04X" "$port")
+
+    # Search /proc/net/tcp for the port in hexadecimal.
+    # The output format is: `sl: local_address:local_port ... uid ... inode`
+    # We are interested in the local address/port and the inode.
+    local line=$(grep ":${hex_port} " /proc/net/tcp | head -n 1)
+
+    if [[ -n "$line" ]]; then
+        local uid=$(echo "$line" | awk '{print $8}')
+        local inode=$(echo "$line" | awk '{print $10}')
+
+        # Now, search the /proc filesystem for a process with that inode.
+        # We look for a symbolic link to the socket.
+        local pid_match=$(find /proc -name "socket:[${inode}]" -exec ls -l {} \; 2>/dev/null | head -n 1)
+
+        if [[ -n "$pid_match" ]]; then
+            # Extract the PID from the find command's output
+            local pid=$(echo "$pid_match" | awk '{print $9}' | cut -d'/' -f3)
+
+            # Use the PID to get the process name and executable path.
+            local proc_name=$(ps -p "$pid" -o comm= 2>/dev/null)
+            local proc_path=$(readlink -f "/proc/$pid/exe" 2>/dev/null)
+
+            echo " (${BOLD}$proc_name${RESET}: $proc_path)"
+        fi
+    fi
+}
+
+# Function to get lsof output for a given port, with sudo permissions.
+# This provides additional detail but may require the user to enter their password.
+function get_lsof_output() {
+    local port=$1
+    local local_ip=$(get_local_ip)
+
+    # Run lsof with sudo to get detailed information about the process.
+    # The output is sent to a temporary file to prevent breaking the progress bar.
+    sudo lsof -i TCP:"$port" > /tmp/lsof_output 2>/dev/null
+    # Check if the temporary file is not empty
+    if [ -s /tmp/lsof_output ]; then
+        # Read the file and format the output
+        local output=$(cat /tmp/lsof_output)
+        rm /tmp/lsof_output # Clean up the temporary file
+
+        # Use awk to format the lsof output in a tree-like structure
+        echo "$output" | awk -v local_ip="$local_ip" '
+        # Skip the header line from lsof
+        NR==1 { next }
+        {
+            # Store the PID
+            pid = $2
+
+            # Find the executable path
+            executable_path = "N/A"
+            cmd = "readlink -f /proc/" pid "/exe 2>/dev/null"
+            if ((cmd | getline executable_path) > 0) {
+                 # The path is found
+            } else {
+                 executable_path = "N/A"
+            }
+            close(cmd)
+
+            # Construct the URL
+            url = "N/A"
+            split($9, name_parts, ":")
+            host = name_parts[1]
+            port = name_parts[2]
+
+            # Determine the protocol based on the port number
+            protocol = "http://"
+            if (port == "443") {
+                protocol = "https://"
+            }
+
+            if (host == "*") {
+                url = local_ip ":" port
+            } else if (host == "localhost") {
+                url = "127.0.0.1:" port
+            } else {
+                url = $9
+            }
+
+            # Print the formatted outline
+            printf "\t- Process: %s\n", $1
+            printf "\t  PID: %s\n", pid
+            printf "\t  User: %s\n", $3
+            printf "\t  URL: %s%s\n", protocol, url
+            printf "\t  Path: %s\n\n", executable_path
+        }'
+    fi
+}
+
+# Function to print a found port with detailed process information to both terminal and log file
+function print_open_port() {
+    local port=$1
+    local proc_info=$(find_proc_info "$port")
+
+    # First, move the cursor to the beginning of the line
+    # Then clear the line to remove any previous progress message
+    # Then print the open port message with a newline
+    printf "\r\033[K${GREEN}✅ Port ${BOLD}%s${RESET}${GREEN} is open %s\n" "$port" "$proc_info" | tee -a "$LOG_FILE"
+
+    # Get the detailed lsof output and print it to both terminal and log file
+    local lsof_output=$(get_lsof_output "$port")
+    if [ -n "$lsof_output" ]; then
+        printf "${CYAN}%s\n${RESET}" "$lsof_output" | tee -a "$LOG_FILE"
+    fi
+}
+
+# Main script logic
+echo "${CYAN}Starting port scan on ${BOLD}$HOST${RESET}${CYAN}...${RESET}" | tee "$LOG_FILE"
+echo "${CYAN}Scanning from port ${BOLD}$START_PORT${RESET}${CYAN} to ${BOLD}$END_PORT${RESET}${CYAN}.${RESET}" | tee -a "$LOG_FILE"
+echo "${CYAN}Log file: ${BOLD}$LOG_FILE${RESET}" | tee -a "$LOG_FILE"
+echo "${CYAN}---${RESET}" | tee -a "$LOG_FILE"
+
+# Loop through each port
+for port in $(seq $START_PORT $END_PORT); do
+    # Use netcat to check the port with a 1-second timeout
+    nc -z -w 1 "$HOST" "$port" >/dev/null 2>&1
+
+    # Check if the connection was successful
+    if [ $? -eq 0 ]; then
+        # Call the function to print the open port with process info
+        print_open_port "$port"
+    fi
+
+    # Update the counter for the progress indicator
+    PORTS_CHECKED=$((PORTS_CHECKED + 1))
+
+    # Print the single-line progress indicator showing current port and count
+    printf "${CYAN}Scanning... Port %d (%d/%d ports checked)\r${RESET}" "$port" "$PORTS_CHECKED" "$TOTAL_PORTS"
+done
+
+# Print a final newline to clean up the terminal after the loop
+printf "\n${CYAN}---${RESET}\n${CYAN}Scan complete.${RESET}\n" | tee -a "$LOG_FILE"

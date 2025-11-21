@@ -1,0 +1,43 @@
+#!/bin/bash
+
+# A simple script to create a dummy file of a given size.
+# It uses 'fallocate' for efficient file creation.
+
+# Check if an argument was provided
+if [ -z "$1" ]; then
+  echo "Usage: $0 <size_in_gb>"
+  echo "Example: $0 5"
+  exit 1
+fi
+
+# Get the size in gigabytes from the first argument
+SIZE_GB=$1
+
+# Check if the size is a valid number and greater than zero
+if ! [[ "$SIZE_GB" =~ ^[0-9]+(\.[0-9]+)?$ ]] || (( $(echo "$SIZE_GB > 0" | bc -l) == 0 )); then
+  echo "Error: Please provide a positive numeric value for the size."
+  exit 1
+fi
+
+# Check if 'bc' is installed to perform floating-point arithmetic
+if ! command -v bc &> /dev/null; then
+    echo "Error: 'bc' is not installed. Please install it using 'sudo apt install bc'."
+    exit 1
+fi
+
+# Calculate the size in bytes (1 GB = 1024^3 bytes).
+# We use 'bc' for floating-point calculations to handle decimal input.
+# The result is rounded to the nearest integer.
+SIZE_BYTES=$(echo "scale=0; ($SIZE_GB * 1024 * 1024 * 1024) / 1" | bc)
+
+# Create the file using fallocate.
+# The file name will be dummy_file_<size>GB.
+fallocate -l "$SIZE_BYTES" "dummy_file_${SIZE_GB}GB"
+
+# Print a confirmation message
+if [ $? -eq 0 ]; then
+  echo "Successfully created dummy file: dummy_file_${SIZE_GB}GB with size ${SIZE_GB}GB."
+else
+  echo "An error occurred while creating the file."
+  exit 1
+fi

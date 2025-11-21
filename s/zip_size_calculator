@@ -1,0 +1,47 @@
+#!/bin/bash
+
+# Check if a directory path is provided as an argument
+if [ -z "$1" ]; then
+    echo "Usage: $0 <path_to_folder>"
+    exit 1
+fi
+
+total_compressed_size=0
+total_uncompressed_size=0
+zip_count=0
+search_path="$1"
+
+# Check if the provided path exists and is a directory
+if [ ! -d "$search_path" ]; then
+    echo "Error: Directory not found at $search_path"
+    exit 1
+fi
+
+echo "Starting scan of $search_path for .zip files..."
+echo "-----------------------------------"
+
+# Find all zip files and process them
+find "$search_path" -type f -name "*.zip" | while read -r zip_file; do
+    echo "Processing: $zip_file"
+    
+    # Get the compressed size of the current file
+    compressed_size=$(stat -c %s "$zip_file" 2>/dev/null)
+    
+    # Use awk to find the last line that starts with a number, which is the total size.
+    uncompressed_size=$(unzip -l "$zip_file" 2>/dev/null | awk '/^ *[0-9]+ / {last=$1} END {print last}')
+    
+    # Check if a valid number was found and that the compressed size is not zero
+    if [[ "$uncompressed_size" =~ ^[0-9]+$ ]] && [[ "$compressed_size" -gt 0 ]]; then
+        total_compressed_size=$((total_compressed_size + compressed_size))
+        total_uncompressed_size=$((total_uncompressed_size + uncompressed_size))
+        zip_count=$((zip_count + 1))
+        
+        echo "  Compressed: $((compressed_size / 1048576))MB"
+        echo "  Uncompressed: $((uncompressed_size / 1048576))MB"
+        echo "  Current Totals: $((total_compressed_size / 1048576))MB (Compressed) / $((total_uncompressed_size / 1048576))MB (Uncompressed)"
+        echo "  Files Scanned: $zip_count"
+    else
+        echo "Warning: Skipped unreadable or zero-byte file: $zip_file"
+    fi
+    echo "-----------------------------------"
+done
