@@ -1,0 +1,72 @@
+#!/bin/bash
+
+# --- Script to Generate Directory Tree and Update index.html ---
+# This script uses the 'tree' command to visualize the directory structure.
+# If 'tree' is not installed, it falls back to a functional-style 'find' pipeline.
+
+# 1. Define the output file path.
+OUTPUT_FILE="index.html"
+
+# 1.5. Prepare the ignore patterns by reading .gitignore and adding mandatory exclusions.
+# Mandatory exclusions: the output file itself and the .git directory.
+IGNORE_PATTERNS_BASE="$OUTPUT_FILE|*.git"
+DYNAMIC_PATTERNS=""
+
+if [ -f .gitignore ]; then
+    # Read patterns from .gitignore, filtering comments (#) and empty lines, and joining them with '|' for the 'tree' command.
+    # The 'paste -s -d| -' command is used to efficiently join all lines with the '|' delimiter.
+    DYNAMIC_PATTERNS=$(grep -vE '^\s*#|^\s*$' .gitignore | paste -s -d'|' -)
+fi
+
+# Combine base exclusions with dynamically loaded .gitignore patterns
+if [ -z "$DYNAMIC_PATTERNS" ]; then
+    FULL_IGNORE_PATTERN="$IGNORE_PATTERNS_BASE"
+else
+    FULL_IGNORE_PATTERN="$IGNORE_PATTERNS_BASE|$DYNAMIC_PATTERNS"
+fi
+
+# Function: Generates a basic tree view using find and sed pipelines (functional approach in shell)
+# This fallback is simple and only implements basic mandatory exclusions.
+generate_find_tree_fallback() {
+    # Exclude .git directory and the index.html file (the output file).
+    # NOTE: This is a basic exclusion and does NOT honor all .gitignore rules.
+    find . -not -path './.git/*' -not -name "$OUTPUT_FILE" -print | sed \
+        -e 's;[^/]*/;|____;g' \
+        -e 's;____|; |;g' \
+        -e 's;___|; |;g'
+}
+
+# 2. Start the HTML content, using the <pre> tag to preserve the tree's formatting.
+echo "<!DOCTYPE html>
+<html lang=\"en\">
+<head>
+    <meta charset=\"UTF-8\">
+    <title>Repository File Tree Index</title>
+    <style>
+        body { font-family: monospace; padding: 20px; background-color: #1f2937; color: #f9fafb; }
+        pre { margin: 0; padding: 0; }
+    </style>
+</head>
+<body>
+<pre>" > "$OUTPUT_FILE"
+
+# 3. Generate the tree structure.
+# We check if the 'tree' command is available (it provides a much cleaner, graphical view).
+if command -v tree &> /dev/null
+then
+    # Method 1 (Preferred): Use 'tree' with the comprehensive ignore pattern.
+    # -a (all files) is used, but we exclude them with -I using the FULL_IGNORE_PATTERN.
+    tree -a -I "$FULL_IGNORE_PATTERN" --charset=ascii >> "$OUTPUT_FILE" 2>&1
+else
+    # Method 2 (Fallback): Use the 'functional' find pipeline wrapped in a function.
+    echo "--- WARNING: 'tree' command not found. Using simple 'find' list (gitignore NOT fully applied). ---" >> "$OUTPUT_FILE"
+    generate_find_tree_fallback >> "$OUTPUT_FILE" 2>&1
+fi
+
+# 4. End the HTML content.
+echo "</pre>
+</body>
+</html>" >> "$OUTPUT_FILE"
+
+echo "✅ Successfully generated file tree and saved it to $OUTPUT_FILE."
+echo "Remember to commit and push $OUTPUT_FILE to GitHub to update your Pages site!"
