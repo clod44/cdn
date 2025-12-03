@@ -1,0 +1,93 @@
+#!/bin/bash
+
+SIDEBAR_WIDTH="\033[13C"
+
+RED='\033[1;31m'
+BLUE='\033[1;34m'
+GRAY='\033[1;30m'
+NC='\033[0m'
+
+check_root() {
+    if [ "$EUID" -ne 0 ]; then
+        echo "Error: Root privileges required (sudo)."
+        exit 1
+    fi
+}
+
+check_deps() {
+    if ! command -v strace &> /dev/null; then
+        echo "Error: 'strace' is not installed."
+        exit 1
+    fi
+}
+
+scan_targets() {
+    echo "Scanning for active sessions..."
+    echo "-----------------------------------------------------------------"
+    printf "%-8s | %-15s | %-10s | %s\n" "PID" "USER" "TTY" "COMMAND"
+    echo "-----------------------------------------------------------------"
+
+    CURRENT_TTY=$(tty | sed 's|/dev/||')
+
+    ps -eo pid,user,tty,args --no-headers | \
+    grep "pts/" | \
+    grep -E "bash|zsh|sh|dash|fish" | \
+    grep -v "grep" | \
+    awk -v mytty="$CURRENT_TTY" '{
+        pid=$1; user=$2; tty=$3;
+        cmd=""; for (i=4; i<=NF; i++) cmd = cmd $i " ";
+        marker=""
+        if (tty == mytty) marker=" (current)"
+        printf "%-8s | %-15s | %-10s | %s%s\n", pid, user, tty, cmd, marker
+    }'
+    echo "-----------------------------------------------------------------"
+    echo -e "Usage: sudo $(basename "$0") <PID>"
+}
+
+process_stream() {
+    echo -e "${GRAY}TIME         | LIVE FEED${NC}"
+    echo -e "${GRAY}-------------+-------------------------------------------${NC}"
+
+    printf "${BLUE}[$(date +%T)] | ${NC}"
+
+    while IFS= read -r line; do
+        line="${line//\\r/\\r$SIDEBAR_WIDTH}"
+        current_time=$(date +%T)
+        new_prompt="\\n${BLUE}[$current_time] | ${NC}"
+        line="${line//\\n/$new_prompt}"
+        printf "%b" "$line"
+    done
+}
+
+start_surveillance() {
+    TARGET_PID=$1
+    if ! ps -p "$TARGET_PID" > /dev/null; then
+        echo "Error: PID $TARGET_PID not found."
+        exit 1
+    fi
+
+    echo "Attaching to PID ${TARGET_PID}..."
+    echo "Press CTRL+C to stop."
+    echo ""
+
+    trap "echo -e '\n[!] Stopped.'; exit 0" SIGINT
+
+    strace -f -p "$TARGET_PID" -e trace=write -s 9999 2>&1 | \
+    grep --line-buffered 'write([12],' | \
+    sed -u -E 's/^.*write\([0-9]+, "(.*)", [0-9]+\)\s+= [0-9]+$/\1/' | \
+    process_stream
+    
+    echo -e "\n\n[!] Target disconnected."
+    exit 0
+}
+
+check_root
+check_deps
+
+if [ -z "$1" ]; then
+    scan_targets
+elif [ "$1" == "-h" ]; then
+    echo "Usage: sudo $0 [PID]"
+else
+    start_surveillance "$1"
+fi
