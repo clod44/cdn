@@ -1,0 +1,91 @@
+#!/bin/bash
+
+trap 'printf "\e[?25h\e[0m"; clear; exit 0' INT TERM EXIT
+
+main() {
+    local speed=${1:-50}
+    local rows=$(tput lines)
+    local cols=$(tput cols)
+    local seed=$RANDOM
+
+    awk -v rows="$rows" -v cols="$cols" -v speed="$speed" -v seed="$seed" '
+    BEGIN {
+        srand(seed)
+        
+        # Original string (Light -> Dense)
+        src = "`.-'\'':_,^=;><+!rc*/z?sLTv)J7(|Fi{C}fI31tlu[neoZ5Yxjya]2ESwqkP6h9d4VpOGbUAKXHm8RD#$Bg0MNWQ%&@"
+        
+        # Reverse it to be Dense -> Light -> Empty
+        chars = ""
+        len = length(src)
+        for (i = len; i >= 1; i--) {
+            chars = chars substr(src, i, 1)
+        }
+        chars = chars " " 
+        
+        steps = length(chars) - 1
+        total_cells = rows * cols
+        
+        # Total "Ink" is the sum of all density levels on screen
+        current_ink = total_cells * steps
+        
+        # Factor determines how much ink we remove per frame relative to what remains
+        # Higher speed input = smaller divisor = larger batches
+        divisor = 20000 / (speed + 1)
+        if (divisor < 1) divisor = 1
+
+        printf "\033[?25l"
+        
+        # Instant draw - no pre-calculation
+        full_line = ""
+        base_char = substr(chars, 1, 1)
+        for (i = 0; i < cols; i++) full_line = full_line base_char
+        for (y = 1; y <= rows; y++) printf "\033[%d;1H%s", y, full_line
+
+        # Initialize pool of active pixels
+        for (i = 0; i < total_cells; i++) {
+            pool[i] = i
+            grid[i] = 1 # Start at index 1 (Dense)
+        }
+        pool_size = total_cells
+
+        while (pool_size > 0) {
+            # Exponential Curve: Batch size depends on remaining ink
+            # As ink drops, batch size drops.
+            batch = int(current_ink / divisor)
+            if (batch < 1) batch = 1
+            
+            buffer = ""
+            
+            for (b = 0; b < batch; b++) {
+                if (pool_size == 0) break
+
+                # Pick a random pixel from the active pool
+                r = int(rand() * pool_size)
+                idx = pool[r]
+                
+                # Degrade the pixel
+                state = ++grid[idx]
+                char = substr(chars, state, 1)
+                
+                y = int(idx / cols) + 1
+                x = (idx % cols) + 1
+                buffer = buffer sprintf("\033[%d;%dH%s", y, x, char)
+                
+                current_ink--
+
+                # If pixel is now empty (last step), remove from pool
+                if (state == steps + 1) {
+                    pool[r] = pool[pool_size - 1]
+                    pool_size--
+                }
+            }
+            printf "%s", buffer
+        }
+        
+        printf "\033[?25h"
+        system("clear")
+    }'
+}
+
+main "$@"
