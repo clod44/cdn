@@ -1,0 +1,36 @@
+#!/bin/bash
+
+FILE=$1
+TARGET_DATE=$2
+
+if [ -z "$FILE" ]; then
+    echo "Usage: tt <file> [date]"
+    exit 1
+fi
+
+# 1. Determine the target date
+if [ -z "$TARGET_DATE" ]; then
+    # Grab Birth date (or Modify if Birth is unavailable) and use as base
+    TARGET_DATE=$(stat -c '%y' "$FILE" | cut -d'.' -f1)
+fi
+
+# 2. Generate random nanoseconds (9 digits)
+# This ensures we don't have .000000000
+RAND_NANO=$(shuf -i 100000000-999999999 -n 1)
+FINAL_TS="${TARGET_DATE}.${RAND_NANO}"
+
+# 3. Execution
+sudo timedatectl set-ntp false
+sudo date -s "$TARGET_DATE" > /dev/null
+
+# Apply the high-precision timestamp
+sudo touch -d "$FINAL_TS" "$FILE"
+
+# Match Change/Birth by doing a quick metadata refresh while clock is back
+# This forces ctime to the past
+sudo chmod $(stat -c '%a' "$FILE") "$FILE"
+
+sudo timedatectl set-ntp true
+
+echo "Fixed: $FILE"
+stat "$FILE"
