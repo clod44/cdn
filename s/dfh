@@ -1,149 +1,59 @@
 #!/bin/bash
 
-# A script to display disk usage statistics from 'df -m' in a cleaner, color-coded format.
-# Designed to be run with 'watch -d -n 0.1' for real-time, glowing updates.
-# This version dynamically adjusts to terminal width, wraps long mount paths, and right-aligns stats.
+FIXED_INFO_WIDTH=33
+MIN_MP_WIDTH=25
 
-# Define ANSI colors as global variables, using brighter codes as requested.
-L_GREEN="\033[1;32m"  # Bright Green for low usage (Foreground)
-L_YELLOW="\033[1;33m" # Bright Yellow for moderate usage (Foreground)
-L_RED="\033[1;31m"    # Bright Red for high usage (Foreground)
-L_CYAN="\033[1;36m"   # Bright Cyan for borders/header (Foreground)
+c_reset='\033[0m'
+c_mount='\033[1;34m'
+c_size='\033[0;32m'
+c_human='\033[1;30m'
 
-# Background colors for striping (Dark Gray and Black)
-BG_GRAY="\033[48;5;236m" # Dark Gray Background (A common choice for terminal striping)
-BG_BLACK="\033[40m"      # Black Background
-NC="\033[0m"          # No Color/Reset (Resets foreground and background)
+term_width=$(tput cols 2>/dev/null || echo ${COLUMNS:-80})
 
-# Bash function to determine the color based on the percentage
-# $1: The usage percentage (integer)
-get_color_code() {
-    local percent=$1
-    if (( percent >= 75 )); then
-        echo -e "$L_RED"
-    elif (( percent >= 30 )); then
-        echo -e "$L_YELLOW"
-    else
-        echo -e "$L_GREEN"
-    fi
-}
+min_tile_width=$((FIXED_INFO_WIDTH + MIN_MP_WIDTH))
 
-# Bash function to format numbers with thousands commas
-# $1: The number (string)
-format_number_commas() {
-    local num=$1
-    echo "$num" | sed -E ':a;s/\B([0-9]{3})($|[^0-9])/\,\1\2/g;ta'
-}
+num_cols=$((term_width / min_tile_width))
+if [[ $num_cols -lt 1 ]]; then num_cols=1; fi
 
-# --- TERMINAL SETUP AND DATA PREPARATION ---
+actual_tile_width=$((term_width / num_cols))
 
-# Get terminal width, or default to 80 if tput fails
-TERM_WIDTH=$(tput cols 2>/dev/null || echo 80)
-# Fixed width for the entire stats block, including spaces and parenthesis:
-# (Used 8 chars + / 1 char + Total 8 chars) + 2 spaces + (Use% 5 chars) + 1 space = 25
-STATS_BLOCK_WIDTH=25 
+mp_width=$((actual_tile_width - FIXED_INFO_WIDTH - 1))
 
-# Get disk usage data (First Pass).
-DISK_DATA=$(df -m | tail -n +2 | tr -s ' ' | grep -vE '(/dev/loop|/var/lib/docker|tmpfs|none)' | sort -k6)
+main() {
+    local fmt_str="${c_mount}%-${mp_width}.${mp_width}s${c_reset} ${c_size}%11s MB${c_reset} ${c_human}%-17s${c_reset}\n"
 
-# --- MAIN EXECUTION (Second Pass for Printing) ---
+    mapfile -t disks < <(
+        LC_ALL=C df --output=target,used,size | \
+        grep -E '^/media|^/$' | \
+        sort -V | \
+        while read -r mp used total; do
+            mb=$((used / 1024))
+            mb_pretty=$(printf "%'.f" $mb)
+            
+            h_used=$(numfmt --from-unit=1024 --to=iec --format="%.1f" "$used")
+            h_total=$(numfmt --from-unit=1024 --to=iec --format="%.1f" "$total")
+            
+            compact_str="[${h_used} / ${h_total}]"
 
-BORDER_LINE=$(printf "=%.0s" $(seq 1 $TERM_WIDTH))
+            printf "$fmt_str" "$mp" "$mb_pretty" "$compact_str"
+        done
+    )
 
-# Print Top Border
-echo -e "$L_CYAN$BORDER_LINE$NC"
+    local count=0
+    for disk in "${disks[@]}"; do
+        echo -ne "$disk"
+        echo -ne " " 
 
-# --- Header Row Alignment Fix ---
-MOUNT_TITLE_WIDTH=25
-# Total width of the right-side header titles: "USAGE (MB)" (10) + " " (1) + "USE %" (5) = 16 characters
-STATS_HEADER_TITLE_WIDTH=16
+        ((count++))
 
-# Calculate the exact padding width needed to push the right-side titles to the edge.
-HEADER_PADDING=$((TERM_WIDTH - MOUNT_TITLE_WIDTH - STATS_HEADER_TITLE_WIDTH))
-
-# Ensure padding is at least 1 space.
-if (( HEADER_PADDING < 1 )); then HEADER_PADDING=1; fi
-
-# Create the padding string using the calculated width
-printf -v HEADER_SPACE " %.0s" $(seq 1 $HEADER_PADDING)
-
-# Print a custom, colorful header: 
-# %-25s (Mount Title) | %s (Padding string) | %s (USAGE (MB)) | %s (USE %)
-printf "$L_CYAN%-25s%s%-10s %s$NC\n" "MOUNT POINT (FILESYSTEM)" "$HEADER_SPACE" "USAGE (MB)" "USE %"
-# --- End Header Row Fix ---
-
-LINE_COUNT=0
-# Loop through the data for final printing
-while read -r FS TOTAL USED AVAILABLE USE_PERCENT MOUNT; do
-
-    # Skip lines that might have been filtered but still appear due to read bug or data structure change
-    if [ -z "$FS" ] || [ "$FS" == "Filesystem" ]; then
-        continue
-    fi
-
-    # 1. Extract and clean data and update line count
-    LINE_COUNT=$((LINE_COUNT + 1))
-    PERCENT_INT=$(echo "$USE_PERCENT" | sed 's/%//')
-    FORMATTED_USED=$(format_number_commas "$USED")
-    FORMATTED_TOTAL=$(format_number_commas "$TOTAL")
-    COLOR=$(get_color_code "$PERCENT_INT")
-    MOUNT_LABEL="$MOUNT ($FS)"
-
-    # 2. Determine background color based on line count
-    if (( LINE_COUNT % 2 == 0 )); then
-        ROW_BG="$BG_GRAY"
-    else
-        ROW_BG="$BG_BLACK"
-    fi
-
-    # 3. Construct the color-coded stats string (EXCLUDING the final $NC reset)
-    STATS_LINE=$(printf "%8s/%-8s %s(%s)" \
-        "$FORMATTED_USED" \
-        "$FORMATTED_TOTAL" \
-        "$COLOR" \
-        "$USE_PERCENT")
-    
-    # 4. Calculate MOUNT_WIDTH and Wrap the MOUNT_LABEL
-    MOUNT_WRAP_WIDTH=$((TERM_WIDTH - STATS_BLOCK_WIDTH))
-    # -s breaks lines only at spaces; -w sets the maximum line width.
-    MOUNT_LABEL_WRAPPED=$(echo "$MOUNT_LABEL" | fold -s -w "$MOUNT_WRAP_WIDTH")
-    
-    # 5. Split the wrapped output into an array of lines
-    IFS=$'\n' read -rd '' -a WRAP_LINES <<< "$MOUNT_LABEL_WRAPPED"
-
-    # 6. Print the first line with stats right-aligned
-    FIRST_LINE=${WRAP_LINES[0]}
-    
-    # Calculate the space needed to push the stats right: 
-    # Term Width - Length of the first line - Stats block width (25)
-    PADDING_W=$((TERM_WIDTH - ${#FIRST_LINE} - STATS_BLOCK_WIDTH))
-    
-    # Ensure padding is at least 1 space for separation.
-    if (( PADDING_W < 1 )); then
-        PADDING_W=1
-    fi
-    
-    # Use printf -v to create a padding string of PADDING_W spaces
-    printf -v PADDING " %.0s" $(seq 1 $PADDING_W)
-    
-    # Print the first line: Background | Label | Padding | Stats (Right-aligned) | NC reset
-    echo -e "${ROW_BG}${FIRST_LINE}${PADDING}${STATS_LINE}${NC}"
-
-    # 7. Print subsequent wrapped lines (only the label, full width)
-    for ((i=1; i<${#WRAP_LINES[@]}; i++)); do
-        # Calculate padding needed to fill the rest of the line (TERM_WIDTH - current line length)
-        # This is CRITICAL to ensure the BG color fills the entire terminal width.
-        WRAP_LINE_LEN=${#WRAP_LINES[i]}
-        WRAP_PADDING_W=$((TERM_WIDTH - WRAP_LINE_LEN))
-        
-        # Use printf -v to create a padding string of spaces
-        printf -v WRAP_PADDING " %.0s" $(seq 1 $WRAP_PADDING_W)
-        
-        # Print the wrapped line, left-aligned, filling to the right edge with BG color
-        echo -e "${ROW_BG}${WRAP_LINES[i]}${WRAP_PADDING}${NC}"
+        if [[ $((count % num_cols)) -eq 0 ]]; then
+            echo "" 
+        fi
     done
+    
+    if [[ $((count % num_cols)) -ne 0 ]]; then
+        echo ""
+    fi
+}
 
-done <<< "$DISK_DATA" # Pass the buffered data into the loop
-
-# Print Bottom Border
-echo -e "$L_CYAN$BORDER_LINE$NC"
+main
