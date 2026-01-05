@@ -1,5 +1,4 @@
 #!/bin/bash
-
 FIXED_INFO_WIDTH=33
 MIN_MP_WIDTH=25
 
@@ -9,19 +8,15 @@ c_size='\033[0;32m'
 c_human='\033[1;30m'
 
 term_width=$(tput cols 2>/dev/null || echo ${COLUMNS:-80})
-
 min_tile_width=$((FIXED_INFO_WIDTH + MIN_MP_WIDTH))
-
 num_cols=$((term_width / min_tile_width))
+
 if [[ $num_cols -lt 1 ]]; then num_cols=1; fi
-
 actual_tile_width=$((term_width / num_cols))
-
 mp_width=$((actual_tile_width - FIXED_INFO_WIDTH - 1))
 
 main() {
     local fmt_str="${c_mount}%-${mp_width}.${mp_width}s${c_reset} ${c_size}%11s MB${c_reset} ${c_human}%-17s${c_reset}\n"
-
     mapfile -t disks < <(
         LC_ALL=C df --output=target,used,size | \
         grep -E '^/media|^/$' | \
@@ -29,28 +24,21 @@ main() {
         while read -r mp used total; do
             mb=$((used / 1024))
             mb_pretty=$(printf "%'.f" $mb)
-            
             h_used=$(numfmt --from-unit=1024 --to=iec --format="%.1f" "$used")
             h_total=$(numfmt --from-unit=1024 --to=iec --format="%.1f" "$total")
-            
             compact_str="[${h_used} / ${h_total}]"
-
             printf "$fmt_str" "$mp" "$mb_pretty" "$compact_str"
         done
     )
-
     local count=0
     for disk in "${disks[@]}"; do
         echo -ne "$disk"
-        echo -ne " " 
-
+        echo -ne " "
         ((count++))
-
         if [[ $((count % num_cols)) -eq 0 ]]; then
-            echo "" 
+            echo ""
         fi
     done
-    
     if [[ $((count % num_cols)) -ne 0 ]]; then
         echo ""
     fi
