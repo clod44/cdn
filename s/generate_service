@@ -1,0 +1,65 @@
+#!/bin/bash
+
+# 1. Input Check
+if [ -z "$1" ]; then
+    echo "Usage: sudo generate_service <path_to_executable>"
+    echo "Example: sudo generate_service ./ip_ws"
+    exit 1
+fi
+
+TARGET_FILE="$1"
+
+# 2. Path & User Resolution
+# Get absolute path to handle relative paths like ./ip_ws
+FULL_PATH=$(realpath "$TARGET_FILE")
+DIR_PATH=$(dirname "$FULL_PATH")
+FILE_NAME=$(basename "$FULL_PATH")
+SERVICE_NAME="${FILE_NAME}.service"
+
+# Check if file exists
+if [ ! -f "$FULL_PATH" ]; then
+    echo "Error: File '$FULL_PATH' not found."
+    exit 1
+fi
+
+# Make sure it is executable
+chmod +x "$FULL_PATH"
+
+# Detect the owner of the file. The service will run as this user.
+# This prevents running everything as root by accident.
+SERVICE_USER=$(stat -c '%U' "$FULL_PATH")
+
+echo "--------------------------------------------------"
+echo "Generating Service: $SERVICE_NAME"
+echo "Target Executable:  $FULL_PATH"
+echo "Working Directory:  $DIR_PATH"
+echo "Run as User:        $SERVICE_USER"
+echo "--------------------------------------------------"
+
+# 3. Write Service File
+# writes to /etc/systemd/system/
+cat <<EOF > /etc/systemd/system/${SERVICE_NAME}
+[Unit]
+Description=Auto-generated service for ${FILE_NAME}
+After=network.target
+
+[Service]
+Type=simple
+User=${SERVICE_USER}
+WorkingDirectory=${DIR_PATH}
+ExecStart=${FULL_PATH}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# 4. Activate Service
+systemctl daemon-reload
+systemctl enable "${SERVICE_NAME}"
+systemctl restart "${SERVICE_NAME}"
+
+# 5. Show Status
+echo "Service '${SERVICE_NAME}' installed and started!"
+systemctl status "${SERVICE_NAME}" --no-pager
