@@ -1,0 +1,32 @@
+#!/bin/bash
+
+NAME_FORMAT="dicom_"
+ROOT_DIR="/media"
+
+for i in {0..99}; do
+    if [ "$i" -eq 0 ]; then
+        CURRENT_NAME="${NAME_FORMAT%_}"
+    else
+        CURRENT_NAME="${NAME_FORMAT}${i}"
+    fi
+
+    TARGET="$ROOT_DIR/$CURRENT_NAME/Archive"
+
+    if [ -d "$TARGET" ]; then
+        echo "📂 /$CURRENT_NAME"
+        
+        for year_path in "$TARGET"/*; do
+            if [ -d "$year_path" ]; then
+                year=$(basename "$year_path")
+                months=$(ls "$year_path" 2>/dev/null | sort -n | paste -sd,)
+                
+                if [ -z "$months" ]; then
+                    echo "   |-- $year (Empty)"
+                else
+                    echo "   |-- $year ($months)"
+                fi
+            fi
+        done
+        echo "---------------------------------"
+    fi
+done

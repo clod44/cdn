@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import json
+import re
+import datetime
+import uuid
+from collections import defaultdict
+
+C_GREEN  = '\033[38;5;46m'
+C_YELLOW = '\033[38;5;226m'
+C_RED    = '\033[38;5;196m'
+C_CYAN   = '\033[38;5;51m'
+C_WHITE  = '\033[1;37m'
+C_GREY   = '\033[38;5;250m'
+C_L_BLUE = '\033[38;5;117m'
+C_RESET  = '\033[0m'
+
+SYM_KEEP = '{}'
+SYM_SAFE = '[]'
+SYM_LOSS = '. '
+
+class DualLogger:
+    def __init__(self, filepath=None):
+        self.file = open(filepath, 'w', encoding='utf-8') if filepath else None
+
+    def log(self, message=""):
+        # Strip ANSI codes for file output
+        clean_msg = re.sub(r'\033\[[0-9;]*m', '', message)
+        if self.file:
+            self.file.write(clean_msg + "\n")
+        print(message)
+
+    def close(self):
+        if self.file:
+            self.file.close()
+
+def check_privileges():
+    if os.geteuid() != 0:
+        print(f"{C_RED}Error: This script requires sudo/root privileges.{C_RESET}")
+        sys.exit(1)
+
+def show_help():
+    print(f"""
+{C_GREEN}DICOM Storage Scanner{C_RESET}
+
+Usage:
+  sudo {sys.argv[0]} -p <paths>   Scan specific paths (comma separated)
+  sudo {sys.argv[0]} -s <file>    Load and view a previous JSON scan
+  {sys.argv[0]} -h                Show this help message
+
+Examples:
+  sudo {sys.argv[0]} -p "/media,/mnt/backup"
+""")
+    sys.exit(0)
+
+def get_path_tag(name, is_root=False):
+    if is_root: return 'root'
+    if re.match(r'^(19|20)[0-9]{2}$', name): return 'year'
+    if re.match(r'^(0?[1-9]|1[0-2])$', name): return 'month'
+
+    lower = name.lower()
+    if 'dicom' in lower: return 'dicom_root'
+    if 'archive' in lower: return 'archive_folder'
+    return 'folder'
+
+def should_skip(name):
+    ignored = {
+        'temp', 'live', 'trash', 'lost+found', 'null', 'recycle', '$re',
+        'system volume information', 'proc', 'sys', 'dev', 'run', 'boot',
+        'usr', 'bin', 'sbin', 'lib', 'lib64', 'var', 'etc', 'opt', 'snap',
+        'program files', 'program files (x86)', 'windows', 'users', 'programdata',
+        'application data', '$recycle.bin', 'config.msi', 'appdata'
+    }
+    return any(x in name.lower() for x in ignored)
+
+def is_leaf_node(name):
+    return re.match(r'^([1-9]|[12][0-9]|3[01])$', name) or re.match(r'^[0-9]+\.[0-9]+\.[0-9]+', name)
+
+def create_leaf(entry):
+    return {
+        'name': entry.name,
+        'path': entry.path,
+        'tag': 'day',
+        'info': 'leaf node ignored',
+        'contents': []
+    }
+
+def scan_path(path):
+    display_path = (path[:75] + '..') if len(path) > 75 else path
+    sys.stderr.write(f"\r{C_GREEN}[SCANNING]{C_RESET} {display_path:<80}")
+
+    name = os.path.basename(path) or path
+    tag = get_path_tag(name)
+
+    node = {
+        'name': name,
+        'path': path,
+        'tag': tag,
+        'contents': []
+    }
+
+    try:
+        with os.scandir(path) as it:
+            entries = sorted(list(it), key=lambda e: e.name)
+
+            for entry in entries:
+                if should_skip(entry.name):
+                    continue
+
+                if is_leaf_node(entry.name):
+                    node['contents'].append(create_leaf(entry))
+                elif entry.is_dir(follow_symlinks=False):
+                    child = scan_path(entry.path)
+                    if child: node['contents'].append(child)
+
+    except (PermissionError, OSError):
+        return None
+
+    return node
+
+def process_tree_data(data):
+    years_map = defaultdict(lambda: defaultdict(lambda: {'months': set(), 'paths': set()}))
+
+    stack = [(data, 'Unknown')]
+
+    while stack:
+        node, current_disk = stack.pop()
+
+        name = node.get('name', '')
+        tag = node.get('tag', '')
+        path = node.get('path', '')
+
+        if tag == 'root' or (path.startswith('/') and path.count('/') <= 2):
+            current_disk = name
+        elif path.startswith('/media/') or path.startswith('/mnt/'):
+             parts = path.split(os.sep)
+             if len(parts) >= 3:
+                 current_disk = parts[2]
+
+        if tag == 'year':
+            months = extract_months(node)
+            for m in months:
+                years_map[name][current_disk]['months'].add(m)
+            years_map[name][current_disk]['paths'].add(path)
+
+        for child in node.get('contents', []):
+            stack.append((child, current_disk))
+
+    return years_map
+
+def extract_months(year_node):
+    months = []
+    for c in year_node.get('contents', []):
+        if c.get('info') == 'leaf node ignored' and c.get('name', '').isdigit():
+            months.append(int(c.get('name')))
+    return months
+
+def render_report(years_map, logger):
+    logger.log(f'\n\n{C_GREEN}[ STORAGE HEATMAP ]{C_RESET}')
+    logger.log('=' * 80)
+    logger.log(f'Legend: {C_GREEN}{SYM_KEEP}{C_RESET} Unique  {C_YELLOW}{SYM_SAFE}{C_RESET} Safe  {C_RED}{SYM_LOSS}{C_RESET} Missing')
+
+    for year in sorted(years_map.keys()):
+        render_year_block(year, years_map[year], logger)
+
+    render_missing_summary(years_map, logger)
+
+def render_year_block(year, disks_data, logger):
+    logger.log(f'\n{C_CYAN}Year: {year}{C_RESET}')
+
+    month_counts = defaultdict(int)
+    for disk in disks_data:
+        for m in disks_data[disk]['months']:
+            month_counts[m] += 1
+
+    disks = sorted(disks_data.keys(), key=lambda d: ('merger' not in d.lower(), -len(disks_data[d]['months'])))
+
+    if not disks: return
+
+    logger.log(f"    010203040506070809101112")
+
+    for disk in disks:
+        row = build_row_string(disks_data[disk]['months'], month_counts)
+
+        raw_paths = sorted(list(disks_data[disk]['paths']))
+        colored_paths = []
+
+        for p in raw_paths:
+            if disk in p:
+                colored = p.replace(disk, f"{C_L_BLUE}{disk}{C_GREY}")
+                colored_paths.append(colored)
+            else:
+                colored_paths.append(p)
+
+        path_str = f", ".join(colored_paths)
+        logger.log(f"    {row}  {C_GREY}[ {path_str} ]{C_RESET}")
+
+def build_row_string(disk_months, global_counts):
+    chars = []
+    for m in range(1, 13):
+        if m in disk_months:
+            if global_counts[m] == 1:
+                chars.append(f'{C_GREEN}{SYM_KEEP}{C_RESET}')
+            else:
+                chars.append(f'{C_YELLOW}{SYM_SAFE}{C_RESET}')
+        else:
+            chars.append(f'{C_RED}{SYM_LOSS}{C_RESET}')
+    return "".join(chars)
+
+def render_missing_summary(years_map, logger):
+    logger.log(f'\n{C_GREEN}[ MISSING DATA REPORT ]{C_RESET}')
+    logger.log('=' * 80)
+
+    missing_found = False
+    for year in sorted(years_map.keys()):
+        all_months = set()
+        for disk in years_map[year]:
+            all_months.update(years_map[year][disk]['months'])
+
+        missing = sorted([m for m in range(1, 13) if m not in all_months])
+
+        if missing:
+            missing_found = True
+            missing_str = ', '.join(map(str, missing))
+            logger.log(f"{C_CYAN}{year:<10}{C_RESET} : {C_RED}{missing_str}{C_RESET}")
+
+    if not missing_found:
+        logger.log(f"{C_GREEN}No missing data detected.{C_RESET}")
+
+def run_scan_mode(path_string):
+    paths = [p.strip() for p in path_string.split(',')]
+    valid_paths = [p for p in paths if os.path.exists(p)]
+
+    if not valid_paths:
+        print(f"{C_RED}Error: No valid paths found.{C_RESET}")
+        sys.exit(1)
+
+    scan_id = str(uuid.uuid4())[:8]
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_filename = f"dicom_scan_result_{scan_id}_{timestamp}"
+
+    print(f"Scanning targets: {', '.join(valid_paths)}", file=sys.stderr)
+
+    root = {
+        'name': 'ROOT',
+        'path': '/',
+        'tag': 'super_root',
+        'uuid': scan_id,
+        'timestamp': timestamp,
+        'command': " ".join(sys.argv),
+        'contents': []
+    }
+
+    for loc in valid_paths:
+        res = scan_path(loc)
+        if res:
+            res['tag'] = 'root'
+            root['contents'].append(res)
+
+    sys.stderr.write("\r" + " " * 100 + "\r")
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    json_outfile = os.path.join(script_dir, f"{base_filename}.json")
+    log_outfile = os.path.join(script_dir, f"{base_filename}.log")
+
+    try:
+        with open(json_outfile, 'w') as f:
+            json.dump(root, f, indent=4)
+        print(f"{C_CYAN}[SAVED JSON]{C_RESET} {json_outfile}", file=sys.stderr)
+        return root, log_outfile
+    except PermissionError:
+        print(f"{C_RED}[ERROR]{C_RESET} Cannot write to directory.")
+        sys.exit(1)
+
+def main():
+    if len(sys.argv) == 1 or '-h' in sys.argv:
+        show_help()
+
+    mode = None
+    target = None
+    log_file_path = None
+
+    if '-s' in sys.argv:
+        try:
+            idx = sys.argv.index('-s')
+            target = sys.argv[idx + 1]
+            mode = 'show'
+        except IndexError:
+            show_help()
+
+    elif '-p' in sys.argv:
+        check_privileges()
+        try:
+            idx = sys.argv.index('-p')
+            target = sys.argv[idx + 1]
+            mode = 'scan'
+        except IndexError:
+            show_help()
+    else:
+        show_help()
+
+    if mode == 'show':
+        try:
+            with open(target, 'r') as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            print(f"{C_RED}File not found.{C_RESET}")
+            sys.exit(1)
+    elif mode == 'scan':
+        data, log_file_path = run_scan_mode(target)
+
+    years_map = process_tree_data(data)
+
+    logger = DualLogger(log_file_path)
+
+    cmd_str = data.get('command', " ".join(sys.argv))
+    ts_str = data.get('timestamp', 'Unknown')
+    logger.log(f"{C_GREY}Command: {cmd_str}{C_RESET}")
+    logger.log(f"{C_GREY}Timestamp: {ts_str}{C_RESET}")
+
+    render_report(years_map, logger)
+
+    logger.close()
+    if log_file_path:
+        print(f"{C_CYAN}[SAVED LOG]{C_RESET}  {log_file_path}", file=sys.stderr)
+
+if __name__ == '__main__':
+    main()

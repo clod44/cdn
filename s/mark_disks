@@ -1,0 +1,36 @@
+#!/bin/bash
+
+SEARCH_DIR="/media"
+
+# Loop through all directories matching Dicom_* in /media
+for dir in "$SEARCH_DIR"/Dicom_*; do
+
+    # Check if it is actually a directory
+    if [ -d "$dir" ]; then
+
+        # 1. Get the folder name (e.g., "Dicom_12")
+        folder_name=$(basename "$dir")
+
+        # 2. Get the UUID of the disk mounted at this location
+        # -n: no header, -o UUID: only show UUID, -T: target path
+        disk_uuid=$(findmnt -n -o UUID --target "$dir")
+
+        # Safety check: if no UUID found (e.g. not a mount point), skip
+        if [ -z "$disk_uuid" ]; then
+            echo "Warning: No UUID found for $dir. Skipping."
+            continue
+        fi
+
+        # 3. Construct the target filename
+        # Format: Dicom_X_UUID
+        target_file="$dir/${folder_name}_${disk_uuid}"
+
+        # 4. Check if file exists, if not, create it
+        if [ -f "$target_file" ]; then
+            echo "Skipping: $target_file already exists."
+        else
+            echo "Creating: $target_file"
+            touch "$target_file"
+        fi
+    fi
+done
