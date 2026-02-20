@@ -1,0 +1,392 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import re
+import json
+import time
+import uuid
+import datetime
+import argparse
+
+# --- CONFIGURATION ---
+SCRIPT_NAME = os.path.basename(sys.argv[0]).replace('.py', '')
+RUN_UUID = str(uuid.uuid4())[:8]
+TIMESTAMP = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+LOG_FILENAME = f"{SCRIPT_NAME}_{RUN_UUID}_{TIMESTAMP}.log"
+JSON_FILENAME = f"{SCRIPT_NAME}_{RUN_UUID}_{TIMESTAMP}.json"
+
+# --- HEURISTICS & CONSTANTS ---
+RE_YEAR  = re.compile(r'^(19|20)\d{2}$')
+RE_MONTH = re.compile(r'^(0?[1-9]|1[0-2])$')
+RE_DAY   = re.compile(r'^(0?[1-9]|[12]\d|3[01])$')
+
+ARCHIVE_NAMES = {'archive', 'dicom', 'data', 'store', 'storage'}
+
+# --- LOGGING SYSTEM ---
+class SessionLogger:
+    def __init__(self):
+        self.log_file = open(LOG_FILENAME, 'w', encoding='utf-8')
+        header = f"SESSION START: {TIMESTAMP}\nUUID: {RUN_UUID}\nCOMMAND: {' '.join(sys.argv)}\n"
+        self.log_file.write(header + "-"*40 + "\n")
+
+    def log(self, msg, end="\n"):
+        sys.stderr.write(msg + end)
+        sys.stderr.flush()
+        clean_msg = msg.replace('\r', '').strip()
+        if clean_msg:
+            self.log_file.write(clean_msg + "\n")
+            self.log_file.flush()
+
+    def close(self):
+        self.log_file.write("\n" + "-"*40 + "\nSESSION END\n")
+        self.log_file.close()
+
+logger = None
+def log(msg):
+    if logger: logger.log(msg)
+    else: sys.stderr.write(msg + "\n")
+
+# --- DATA MODELS ---
+
+class StorageNode:
+    """Base class. Now handles anomalies for EVERYONE."""
+    def __init__(self, name, path):
+        self.name = name
+        self.path = path
+        self.anomalies = [] # List of weird things found inside this node
+
+    def add_anomaly(self, kind, message, scanned_object=None):
+        """
+        kind: 'nested_year', 'unexpected_file', etc.
+        message: Human readable description
+        scanned_object: The full object (Day/Month/Year) if we decided to scan it anyway.
+        """
+        entry = {
+            "kind": kind,
+            "message": message,
+            "found_at": self.path
+        }
+        if scanned_object:
+            entry["data"] = scanned_object.to_dict()
+
+        self.anomalies.append(entry)
+
+    def to_dict(self):
+        d = {"name": self.name, "path": self.path}
+        if self.anomalies:
+            d['anomalies'] = self.anomalies
+        return d
+
+class Day(StorageNode):
+    def __init__(self, name, path):
+        super().__init__(name, path)
+        self.item_count = 0
+        self.is_valid = True
+        self.status = "checked"
+
+    def set_assumed_valid(self):
+        self.item_count = -2
+        self.status = "assumed"
+
+    def perform_safety_check(self):
+        display_name = self.path[-50:] if len(self.path) > 50 else self.path
+        if logger: sys.stderr.write(f"\r      > Sampling: ...{display_name:<50}")
+
+        try:
+            if hasattr(os, 'scandir'):
+                count = 0
+                with os.scandir(self.path) as it:
+                    for _ in it:
+                        count += 1
+                        if count > 1000: break
+                self.item_count = count
+            else:
+                self.item_count = len(os.listdir(self.path))
+
+            if logger: sys.stderr.write(f"\r{' ' * 80}\r")
+
+        except (PermissionError, OSError):
+            self.is_valid = False
+            self.item_count = -1
+            self.status = "error"
+            self.add_anomaly("io_error", "Could not read day folder")
+
+    def to_dict(self):
+        d = super().to_dict()
+        d['count'] = self.item_count
+        d['status'] = self.status
+        return d
+
+class Month(StorageNode):
+    def __init__(self, name, path):
+        super().__init__(name, path)
+        self.days = {}
+
+    def add_day(self, day):
+        self.days[day.name] = day
+
+    def to_dict(self):
+        d = super().to_dict()
+        d['days'] = [day.to_dict() for day in self.days.values()]
+        return d
+
+class Year(StorageNode):
+    def __init__(self, name, path):
+        super().__init__(name, path)
+        self.months = {}
+
+    def add_month(self, month):
+        self.months[month.name] = month
+
+    def to_dict(self):
+        d = super().to_dict()
+        d['months'] = [m.to_dict() for m in self.months.values()]
+        return d
+
+class Disk(StorageNode):
+    def __init__(self, name, path):
+        super().__init__(name, path)
+        self.years = {}
+        self.archive_root_path = None
+
+    def add_year(self, year):
+        self.years[year.name] = year
+
+    def to_dict(self):
+        d = super().to_dict()
+        d['years'] = [y.to_dict() for y in self.years.values()]
+        d['archive_root'] = self.archive_root_path
+        return d
+
+# --- SCANNING LOGIC ---
+
+class SmartScanner:
+    def __init__(self, root_paths):
+        self.root_paths = root_paths.split(',')
+
+    def scan(self):
+        system_inventory = []
+        for root in self.root_paths:
+            log(f"--- Processing Root: {root} ---")
+            if not os.path.exists(root):
+                log(f"Skipping invalid root: {root}")
+                continue
+
+            try:
+                if hasattr(os, 'scandir'):
+                    iterator = os.scandir(root)
+                else:
+                    iterator = [Entry(n, os.path.join(root, n)) for n in os.listdir(root)]
+
+                for entry in iterator:
+                    name = entry.name
+                    path = entry.path if hasattr(entry, 'path') else os.path.join(root, name)
+                    try:
+                        is_dir = entry.is_dir() if hasattr(entry, 'is_dir') else os.path.isdir(path)
+                    except OSError: continue
+
+                    if is_dir and not name.startswith('.'):
+                        if self._is_candidate_disk(name):
+                            log(f"\n[DISK] Found Candidate: {name}")
+                            disk_obj = self._scan_disk(name, path)
+                            system_inventory.append(disk_obj)
+            except PermissionError:
+                log(f"Permission denied accessing root: {root}")
+
+        return system_inventory
+
+    def _is_candidate_disk(self, name):
+        lower = name.lower()
+        return 'dicom' in lower or 'merger' in lower or 'archive' in lower
+
+    def _find_archive_root(self, disk_path):
+        log(f"  > Hunting for Archive Root in: {disk_path}")
+        try:
+            if hasattr(os, 'scandir'):
+                entries = list(os.scandir(disk_path))
+            else:
+                entries = [Entry(n, os.path.join(disk_path, n)) for n in os.listdir(disk_path)]
+        except PermissionError:
+            log(f"  > [ERROR] Permission Denied on Disk Root")
+            return None
+
+        year_count = 0
+        for e in entries:
+            if RE_YEAR.match(e.name):
+                year_count += 1
+
+        if year_count > 0:
+            log(f"  > Found {year_count} years at root level. Root is valid.")
+            return disk_path
+
+        for e in entries:
+            try:
+                is_dir = e.is_dir() if hasattr(e, 'is_dir') else os.path.isdir(e.path)
+            except OSError: continue
+            if is_dir and e.name.lower() in ARCHIVE_NAMES:
+                log(f"  > Found sub-folder '{e.name}'. Using as Root.")
+                return e.path
+
+        log(f"  > [WARN] No valid Archive structure found on this disk.")
+        return None
+
+    def _scan_disk(self, name, path):
+        disk = Disk(name, path)
+        archive_path = self._find_archive_root(path)
+
+        if not archive_path:
+            return disk
+
+        disk.archive_root_path = archive_path
+
+        try:
+            if hasattr(os, 'scandir'):
+                it = os.scandir(archive_path)
+            else:
+                it = [Entry(n, os.path.join(archive_path, n)) for n in os.listdir(archive_path)]
+
+            sorted_items = sorted(list(it), key=lambda x: x.name)
+
+            for item in sorted_items:
+                item_name = item.name
+                item_path = item.path if hasattr(item, 'path') else os.path.join(archive_path, item_name)
+                try:
+                    is_dir = item.is_dir() if hasattr(item, 'is_dir') else os.path.isdir(item_path)
+                except OSError: continue
+
+                if not is_dir: continue
+
+                if RE_YEAR.match(item_name):
+                    log(f"    [YEAR] Scanning {item_name}...")
+                    year_obj = self._scan_year(item_name, item_path)
+                    disk.add_year(year_obj)
+        except PermissionError:
+            pass
+        return disk
+
+    def _scan_year(self, name, path):
+        year = Year(name, path)
+        try:
+            if hasattr(os, 'scandir'):
+                it = os.scandir(path)
+            else:
+                it = [Entry(n, os.path.join(path, n)) for n in os.listdir(path)]
+
+            sorted_items = sorted(list(it), key=lambda x: x.name)
+
+            for item in sorted_items:
+                item_name = item.name
+                item_path = item.path if hasattr(item, 'path') else os.path.join(path, item_name)
+                try:
+                    is_dir = item.is_dir() if hasattr(item, 'is_dir') else os.path.isdir(item_path)
+                except OSError: continue
+
+                if not is_dir: continue
+
+                if RE_MONTH.match(item_name):
+                    month_obj = self._scan_month(item_name, item_path)
+                    year.add_month(month_obj)
+
+                # RECURSIVE ANOMALY HANDLING
+                elif RE_YEAR.match(item_name):
+                    log(f"      [ANOMALY] Nested Year detected: {item_name} - Scanning deeper...")
+                    # RECURSION START: We scan it as a Year object
+                    nested_year_obj = self._scan_year(item_name, item_path)
+
+                    # Store the FULL object inside the anomaly list
+                    year.add_anomaly(
+                        kind="nested_year",
+                        message="Nested Year Folder Detected",
+                        scanned_object=nested_year_obj
+                    )
+
+        except PermissionError:
+            year.add_anomaly("access_denied", "Permission error scanning year")
+        return year
+
+    def _scan_month(self, name, path):
+        month = Month(name, path)
+        try:
+            if hasattr(os, 'scandir'):
+                it = os.scandir(path)
+            else:
+                it = [Entry(n, os.path.join(path, n)) for n in os.listdir(path)]
+
+            valid_day_streak = 0
+            for item in it:
+                item_name = item.name
+                item_path = item.path if hasattr(item, 'path') else os.path.join(path, item_name)
+                try:
+                    is_dir = item.is_dir() if hasattr(item, 'is_dir') else os.path.isdir(item_path)
+                except OSError: continue
+
+                if not is_dir: continue
+
+                if RE_DAY.match(item_name):
+                    day = Day(item_name, item_path)
+                    if valid_day_streak < 3:
+                        day.perform_safety_check()
+                        if day.is_valid and day.item_count != 0:
+                            valid_day_streak += 1
+                    else:
+                        day.set_assumed_valid()
+                    month.add_day(day)
+                else:
+                    # Optional: Detect weird folders in month (like "temp" or "cache")
+                    # month.add_anomaly("unexpected_folder", f"Found {item_name} in month")
+                    pass
+
+        except PermissionError:
+            month.add_anomaly("access_denied", "Permission error scanning month")
+        return month
+
+class Entry:
+    def __init__(self, name, path):
+        self.name = name
+        self.path = path
+    def is_dir(self):
+        return os.path.isdir(self.path)
+
+# --- MAIN ---
+
+def main():
+    global logger
+    parser = argparse.ArgumentParser()
+    parser.add_argument('target', nargs='?')
+    parser.add_argument('--json', help="Load from JSON")
+    args = parser.parse_args()
+
+    if args.json:
+        if not os.path.exists(args.json):
+            sys.exit(1)
+        with open(args.json, 'r') as f:
+            print(json.dumps(json.load(f), indent=2))
+        return
+
+    if not args.target:
+        parser.print_help()
+        sys.exit(1)
+
+    logger = SessionLogger()
+    log(f"SCAN STARTING: {args.target}")
+
+    scanner = SmartScanner(args.target)
+    inventory = scanner.scan()
+
+    output_data = {
+        "meta": {"uuid": RUN_UUID, "timestamp": TIMESTAMP},
+        "inventory": [disk.to_dict() for disk in inventory]
+    }
+
+    with open(JSON_FILENAME, 'w') as f:
+        json.dump(output_data, f, indent=2)
+
+    log(f"\nScan Complete.")
+    log(f"Data saved to: {JSON_FILENAME}")
+    logger.close()
+
+    print(json.dumps(output_data, indent=2))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+
+import json
+import sys
+import os
+import argparse
+from collections import defaultdict
+
+# --- CONFIGURATION ---
+C_RESET  = '\033[0m'
+C_BOLD   = '\033[1m'
+C_GREEN  = '\033[38;5;46m'
+C_RED    = '\033[38;5;196m'
+C_ORANGE = '\033[38;5;208m'
+C_GREY   = '\033[38;5;238m'
+C_WHITE  = '\033[38;5;255m'
+C_BLUE   = '\033[38;5;39m'
+C_CYAN   = '\033[38;5;51m'
+
+# BRAILLE MAP
+BRAILLE_MAP = [0x1, 0x2, 0x4, 0x40, 0x8, 0x10, 0x20, 0x80]
+
+def load_json(filepath):
+    try:
+        with open(filepath, 'r') as f:
+            data = json.load(f)
+            if isinstance(data, dict) and 'inventory' in data:
+                return data['inventory']
+            return data
+    except Exception as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
+def organize_data(inventory):
+    timeline = defaultdict(lambda: defaultdict(lambda: defaultdict(set)))
+    for disk in inventory:
+        disk_name = disk['name']
+        for year in disk.get('years', []):
+            if not isinstance(year['name'], str) or not year['name'].isdigit(): continue
+            yr = int(year['name'])
+            for month in year.get('months', []):
+                if not isinstance(month['name'], str) or not month['name'].isdigit(): continue
+                mn = int(month['name'])
+                for d in month.get('days', []):
+                    if not isinstance(d['name'], str) or not d['name'].isdigit(): continue
+                    day_num = int(d['name'])
+                    status = d.get('status')
+
+                    # --- LOGIC FIX ---
+                    # Only add the specific day_num found in the JSON.
+                    # 'assumed' just means we trust this specific folder exists without deep scanning.
+                    # It does NOT mean we fill the whole month.
+                    if status != 'error':
+                        timeline[yr][disk_name][mn].add(day_num)
+
+    return timeline
+
+def render_braille_block(day_set, start_day):
+    code_point = 0x2800
+    for i in range(8):
+        current_day = start_day + i
+        if current_day > 31: break
+        if current_day in day_set: code_point |= BRAILLE_MAP[i]
+    return chr(code_point)
+
+def render_month_strip(day_set):
+    # Generates 4 chars covering days 1-32
+    return "".join([
+        render_braille_block(day_set, 1),
+        render_braille_block(day_set, 9),
+        render_braille_block(day_set, 17),
+        render_braille_block(day_set, 25)
+    ])
+
+def print_year_view(year, disk_data):
+    # --- DIMENSIONS ---
+    # Label Col Width: 20 chars (including padding)
+    # Month Col Width: 5 chars (4 braille chars + 1 space padding)
+
+    LABEL_WIDTH = 20
+    MONTH_WIDTH = 5
+    TOTAL_DATA_WIDTH = 12 * MONTH_WIDTH  # 60 chars
+
+    # --- BORDER CALCULATION ---
+    # Top prefix "┌── [ YEAR 2026 ] " is 18 chars.
+    # Total width is (LABEL_WIDTH + TOTAL_DATA_WIDTH) + 3 (for the │ separators and spaces).
+    # The math simplifies to:
+    TOP_DASHES = LABEL_WIDTH + TOTAL_DATA_WIDTH - 16
+
+    # --- HEADER ---
+    print(f"\n{C_BOLD}{C_WHITE}┌── [ YEAR {year} ] {'─'*TOP_DASHES}┐{C_RESET}")
+
+    # Column Headers
+    print(f"{C_WHITE}│{C_RESET} {C_GREY}{'SOURCE':<{LABEL_WIDTH-1}}{C_RESET}{C_WHITE}│{C_RESET}", end="")
+    for m in range(1, 13):
+        # 01..12
+        print(f" {C_WHITE}{m:02}{C_RESET}  ", end="")
+    print(f"{C_WHITE}│{C_RESET}")
+
+    # Separator
+    print(f"{C_WHITE}├{'─'*LABEL_WIDTH}┼{'─'*TOTAL_DATA_WIDTH}┤{C_RESET}")
+
+    # --- DATA ROWS ---
+    disks = sorted(disk_data.keys(), key=lambda x: ('merger' in x.lower(), x))
+
+    for disk in disks:
+        # Truncate name if too long
+        display_name = (disk[:LABEL_WIDTH-3] + '..') if len(disk) > LABEL_WIDTH-1 else disk
+        color = C_CYAN if 'merger' in disk.lower() else C_BLUE
+
+        # Name Column
+        print(f"{C_WHITE}│{C_RESET} {color}{display_name:<{LABEL_WIDTH-1}}{C_RESET}{C_WHITE}│{C_RESET}", end="")
+
+        # Month Columns
+        for m in range(1, 13):
+            days = disk_data[disk].get(m, set())
+            if not days:
+                print(f"{C_GREY}.... {C_RESET}", end="")
+            else:
+                strip = render_month_strip(days)
+                color_code = C_GREEN if len(days) >= 28 else C_ORANGE
+                print(f"{color_code}{strip}{C_RESET} ", end="")
+        print(f"{C_WHITE}│{C_RESET}")
+
+    # --- REDUNDANCY SEPARATOR ---
+    print(f"{C_WHITE}├{'─'*LABEL_WIDTH}┼{'─'*TOTAL_DATA_WIDTH}┤{C_RESET}")
+
+    # --- REDUNDANCY ROW ---
+    print(f"{C_WHITE}│{C_RESET} {C_WHITE}{'REDUNDANCY':<{LABEL_WIDTH-1}}{C_RESET}{C_WHITE}│{C_RESET}", end="")
+
+    for m in range(1, 13):
+        all_days = set()
+        day_counts = defaultdict(int)
+
+        # Calculate redundancy per day
+        for disk in disks:
+            d_set = disk_data[disk].get(m, set())
+            for d in d_set:
+                all_days.add(d)
+                day_counts[d] += 1
+
+        # A day is "safe" if it exists on at least 2 disks
+        safe_days = {d for d, c in day_counts.items() if c >= 2}
+
+        if not all_days:
+            print(f"{C_GREY}.... {C_RESET}", end="")
+        else:
+            strip = render_month_strip(safe_days)
+            # If total days > safe days, we have risk (RED)
+            if len(safe_days) < len(all_days):
+                 print(f"{C_RED}{strip}{C_RESET} ", end="")
+            else:
+                 print(f"{C_CYAN}{strip}{C_RESET} ", end="")
+
+    print(f"{C_WHITE}│{C_RESET}")
+
+    # --- BOTTOM BORDER ---
+    print(f"{C_WHITE}└{'─'*LABEL_WIDTH}┴{'─'*TOTAL_DATA_WIDTH}┘{C_RESET}")
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('json_file', nargs='?')
+    parser.add_argument('-y', '--year', type=int)
+    args = parser.parse_args()
+
+    if not args.json_file or not os.path.exists(args.json_file):
+        print("Usage: ./ds2viz <json_file> [-y YEAR]")
+        sys.exit(1)
+
+    timeline = organize_data(load_json(args.json_file))
+    years = sorted(timeline.keys())
+    if args.year: years = [args.year] if args.year in timeline else []
+
+    if not years:
+        print("No matching data found.")
+        sys.exit()
+
+    for y in years:
+        print_year_view(y, timeline[y])
+
+if __name__ == "__main__":
+    main()
